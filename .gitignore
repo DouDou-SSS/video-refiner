@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+venv/
+*.egg-info/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Output directories (should not be committed)
+output/
+博主分析*/
+炼化输出*/
