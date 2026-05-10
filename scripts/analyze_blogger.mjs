@@ -1,9 +1,9 @@
-// 视频创作者方法论蒸馏 - 多视频批量分析 v4
+// 视频创作者方法论蒸馏 - 多视频批量分析 v5
 // 基于 "同事.skill" 的隐性经验蒸馏方法论
-// v4: Camoufox 反检测 + 交叉验证 + 合并精炼输出
+// v5: 常驻Whisper服务 + 蒸馏间隔延迟 + 保留视频不删除
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { OpenAI } from 'openai';
 
 // ========================
@@ -15,6 +15,7 @@ const SCRIPTS_DIR = path.join(SKILL_DIR, 'scripts');
 
 const CAMOUFOX_PY = path.join(SCRIPTS_DIR, 'get_video_info.py');
 const CROSS_VALIDATE_PY = path.join(SCRIPTS_DIR, 'cross_validate.py');
+const WHISPER_SERVICE_PY = path.join(SCRIPTS_DIR, 'whisper_service.py');
 
 // Python 选择：系统python 用于 Whisper（模型已缓存，加载快），camoufox-env 用于 Camoufox
 const SYSTEM_PYTHON = '/opt/homebrew/bin/python3';
@@ -41,6 +42,12 @@ const ANTI_BAN = {
   minDelay: 3000,
   maxDelay: 8000,
   dailyLimit: 50,
+};
+
+// 蒸馏间隔延迟（防止触发云端模型频率限制）
+const DISTILL_DELAY = {
+  minMs: 10000,  // 10秒
+  maxMs: 20000,  // 20秒
 };
 
 // ========================
@@ -122,6 +129,112 @@ function getEnv() {
 }
 
 // ========================
+// 常驻 Whisper 服务管理
+// ========================
+let whisperProc = null;
+let whisperBuffer = '';
+let whisperResolve = null;
+let whisperReject = null;
+let whisperTimeout = null;
+
+async function startWhisperService() {
+  console.log('    🔄 启动 Whisper 常驻服务...');
+  whisperProc = spawn(SYSTEM_PYTHON, [WHISPER_SERVICE_PY], {
+    stdio: ['pipe', 'pipe', 'inherit'],
+    env: getEnv(),
+  });
+
+  whisperProc.stdout.on('data', (data) => {
+    whisperBuffer += data.toString();
+
+    // 检查是否有完整的响应
+    while (true) {
+      const eofIdx = whisperBuffer.indexOf('RESULT_EOF\n');
+      if (eofIdx === -1) break;
+
+      const chunk = whisperBuffer.substring(0, eofIdx).trim();
+      whisperBuffer = whisperBuffer.substring(eofIdx + 'RESULT_EOF\n'.length);
+
+      if (whisperResolve) {
+        clearTimeout(whisperTimeout);
+        if (chunk.startsWith('RESULT_OK ')) {
+          // RESULT_OK <video_id> <length>\n<text>
+          const firstLineEnd = chunk.indexOf('\n');
+          const header = chunk.substring(0, firstLineEnd);
+          const text = chunk.substring(firstLineEnd + 1);
+          whisperResolve({ ok: true, text, header });
+        } else if (chunk.startsWith('RESULT_ERR ')) {
+          // RESULT_ERR <video_id> <error>
+          const err = chunk.substring('RESULT_ERR '.length);
+          const spaceIdx = err.indexOf(' ');
+          const videoId = err.substring(0, spaceIdx);
+          const errMsg = err.substring(spaceIdx + 1);
+          whisperResolve({ ok: false, error: errMsg, videoId });
+        } else {
+          whisperReject(new Error('Unknown response: ' + chunk.substring(0, 100)));
+        }
+        whisperResolve = null;
+        whisperReject = null;
+      }
+    }
+  });
+
+  whisperProc.on('error', (err) => {
+    console.log(`    ❌ Whisper 服务启动失败: ${err.message}`);
+    if (whisperReject) {
+      whisperReject(err);
+      whisperResolve = null;
+      whisperReject = null;
+    }
+  });
+
+  // 等待服务就绪
+  await new Promise((resolve, reject) => {
+    const checkReady = (data) => {
+      const text = data.toString();
+      whisperBuffer += text;
+      if (whisperBuffer.includes('WHISPER_READY')) {
+        whisperProc.stdout.removeListener('data', checkReady);
+        resolve();
+      }
+    };
+    whisperProc.stdout.on('data', checkReady);
+    setTimeout(() => reject(new Error('Whisper 服务启动超时')), 30000);
+  });
+  whisperBuffer = '';  // 清空就绪信号
+
+  console.log('    ✅ Whisper 常驻服务已就绪（模型按需加载，不再重复启动）');
+}
+
+async function whisperTranscribe(videoPath, videoId, modelSize) {
+  return new Promise((resolve, reject) => {
+    whisperResolve = resolve;
+    whisperReject = reject;
+    whisperTimeout = setTimeout(() => {
+      if (whisperReject) {
+        whisperReject(new Error('Whisper 转录超时（30分钟）'));
+        whisperResolve = null;
+        whisperReject = null;
+      }
+    }, 30 * 60 * 1000);
+
+    whisperProc.stdin.write(`TRANSCRIBE ${videoPath} ${videoId} ${modelSize}\n`);
+  });
+}
+
+async function stopWhisperService() {
+  if (whisperProc) {
+    console.log('    🛑 停止 Whisper 常驻服务...');
+    whisperProc.stdin.write('QUIT\n');
+    whisperProc.stdin.end();
+    await new Promise(r => setTimeout(r, 2000));
+    whisperProc.kill();
+    whisperProc = null;
+    console.log('    ✅ Whisper 服务已停止');
+  }
+}
+
+// ========================
 // Camoufox 获取视频信息
 // ========================
 async function getVideoInfoCamoufox(videoId) {
@@ -149,7 +262,7 @@ async function getVideoInfoCamoufox(videoId) {
 async function downloadVideo(videoUrl, outPath) {
   const qUrl = videoUrl.replace(/"/g, '\\"');
   const qPath = outPath.replace(/"/g, '\\"');
-  execSync(`curl -sL -o "${qPath}" "${qUrl}"`, {
+  execSync(`curl -sL -o "${qPath}" "${qUrl}" -H "Referer: https://www.douyin.com/"`, {
     timeout: 120000, stdio: 'pipe'
   });
   const size = fs.statSync(outPath).size;
@@ -188,39 +301,22 @@ async function extractFrames(videoPath, framesDir) {
 async function extractAndValidateTranscript(videoPath, videoId, videoInfo, framesDir) {
   const whisperFile = path.join(TMP_DIR, `whisper_${videoId}.txt`);
 
-  // Step 1: Whisper 语音识别
-  console.log(`    🎙️ Whisper 语音识别...`);
+  // Step 1: Whisper 语音识别（使用常驻服务）
+  console.log(`    🎙️ Whisper 语音识别（常驻服务）...`);
   try {
-    const tmpPy = path.join(TMP_DIR, `_transcript_${videoId}.py`);
-    const duration = videoInfo.duration || 0;
-    const model = duration > 240 ? 'medium' : 'large-v3';
+    // 统一使用 medium（在 Apple Silicon 上比 large-v3 快 2-3 倍）
+    const model = 'medium';
 
-    const pyContent = `import sys, os
-os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
-from faster_whisper import WhisperModel
-video_path = sys.argv[1]
-model = WhisperModel("${model}", device="cpu", compute_type="int8")
-segments, info = model.transcribe(video_path, beam_size=5, language="zh")
-text_parts = []
-for segment in segments:
-    text_parts.append(segment.text)
-result = " ".join(text_parts).strip()
-if result:
-    with open("${whisperFile}", 'w', encoding='utf-8') as f:
-        f.write(result)
-    print(result)
-else:
-    sys.exit(1)
-`;
-    fs.writeFileSync(tmpPy, pyContent, 'utf-8');
+    const result = await whisperTranscribe(videoPath, videoId, model);
 
-    execSync(`"${SYSTEM_PYTHON}" "${tmpPy}" "${videoPath}"`, {
-      timeout: 300000, stdio: ['pipe', 'pipe', 'pipe'], env: getEnv(),
-    });
-    if (fs.existsSync(tmpPy)) fs.unlinkSync(tmpPy);
+    if (!result.ok) {
+      throw new Error(result.error);
+    }
 
-    const whisperText = fs.readFileSync(whisperFile, 'utf-8').trim();
+    const whisperText = result.text.trim();
     if (!whisperText) return null;
+
+    fs.writeFileSync(whisperFile, whisperText, 'utf-8');
     console.log(`    ✓ Whisper: ${whisperText.length}字`);
 
     // Step 2: 交叉验证 + 标点分段
@@ -363,13 +459,13 @@ ${contextNote ? '注意：已有内容已在下方标注，你只需要合并新
 // 主流程
 // ========================
 async function main() {
-  console.log('=== 视频创作者方法论蒸馏 v4（Camoufox + 交叉验证 + 合并精炼）===\n');
+  console.log('=== 视频创作者方法论蒸馏 v5（常驻Whisper服务 + 蒸馏延迟 + 保留视频）===\n');
   console.log(`视频数量: ${videoIds.length}`);
   console.log(`输出目录: ${outputDir}`);
   console.log(`蒸馏模型: ${ANALYSIS_MODEL}（多模态）`);
   console.log(`合并模型: ${FINAL_MODEL} + 思考模式（备用: ${FINAL_MODEL_FALLBACK}）\n`);
 
-  // 检查 Camoufox
+  // 检查环境
   console.log('检查环境...');
   try {
     execSync(`"${SYSTEM_PYTHON}" -c "from faster_whisper import WhisperModel; print('OK')"`, {
@@ -389,6 +485,9 @@ async function main() {
     console.log('  ❌ Camoufox 未安装');
     return;
   }
+
+  // 启动常驻 Whisper 服务（一次加载，全程复用）
+  await startWhisperService();
 
   const allResults = [];
 
@@ -435,15 +534,32 @@ async function main() {
         console.log(`  ⚠️ 文案失败: ${e.message}`);
       }
 
-      // 多维度蒸馏
-      for (const dim of DIMENSIONS) {
-        console.log(`  ⏳ 蒸馏: ${dim.name}...`);
-        const analysis = await analyzeDimension(framesDir, frames, info, dim, transcript);
-        result[dim.name] = analysis;
+      // 资料完整性检查：缺少任何核心资料，跳过蒸馏（宁缺毋滥）
+      const missingMaterials = [];
+      if (!frames || frames.length === 0) missingMaterials.push('帧图');
+      if (!transcript || transcript.length === 0) missingMaterials.push('文案');
 
-        const singleFile = path.join(SINGLE_DIR, `${videoId}_${dim.name}.md`);
-        fs.writeFileSync(singleFile, analysis || '❌ 分析返回为空', 'utf-8');
-        console.log(`  ✓ ${dim.name}`);
+      if (missingMaterials.length > 0) {
+        console.log(`  🚫 资料不全，跳过蒸馏：缺少 ${missingMaterials.join('、')}`);
+        console.log(`     （宁缺毋滥：资料不全的分析结果是垃圾，浪费 API 调用）`);
+        result.distillSkipped = true;
+        result.skipReason = `缺少 ${missingMaterials.join('、')}`;
+      } else {
+        // 多维度蒸馏（每个维度之间加随机延迟，防止触发频率限制）
+        for (const dim of DIMENSIONS) {
+          console.log(`  ⏳ 蒸馏: ${dim.name}...`);
+          const analysis = await analyzeDimension(framesDir, frames, info, dim, transcript);
+          result[dim.name] = analysis;
+
+          const singleFile = path.join(SINGLE_DIR, `${videoId}_${dim.name}.md`);
+          fs.writeFileSync(singleFile, analysis || '❌ 分析返回为空', 'utf-8');
+          console.log(`  ✓ ${dim.name}`);
+
+          // 维度之间加延迟（最后一个维度不需要延迟）
+          if (dim.name !== DIMENSIONS[DIMENSIONS.length - 1].name) {
+            await randomDelay(DISTILL_DELAY.minMs, DISTILL_DELAY.maxMs);
+          }
+        }
       }
 
       allResults.push(result);
@@ -454,7 +570,7 @@ async function main() {
       allResults.push(result);
     }
 
-    // 新手期保留视频
+    // 保留视频到视频保留目录（不删除，等老板确认）
     const keepVideoPath = path.join(VIDEO_KEEP_DIR, `${videoId}.mp4`);
     if (!fs.existsSync(keepVideoPath) && fs.existsSync(videoPath)) {
       fs.copyFileSync(videoPath, keepVideoPath);
@@ -462,19 +578,31 @@ async function main() {
 
     // 清理临时帧
     if (fs.existsSync(framesDir)) fs.rmSync(framesDir, { recursive: true, force: true });
-    // 测试阶段：保留视频文件，不删除
-    if (fs.existsSync(videoPath)) { fs.copyFileSync(videoPath, path.join(VIDEO_KEEP_DIR, videoId + ".mp4")); }
+
+    // 注意：v5 不再删除原始视频文件！等老板确认无误后再手动清理
+    // TMP_DIR 中的视频文件会一直保留
 
     // 保存进度
     saveProgress(allResults, outputDir);
 
+    // 视频间延迟（防封）
     if (i < videoIds.length - 1) {
       await randomDelay(ANTI_BAN.minDelay, ANTI_BAN.maxDelay);
     }
   }
 
-  // 阶段二：合并精炼输出
-  const validResults = allResults.filter(r => !r.error);
+  // 停止 Whisper 常驻服务
+  await stopWhisperService();
+
+  // 阶段二：合并精炼输出（只使用资料完整的视频）
+  const validResults = allResults.filter(r => !r.error && !r.distillSkipped);
+  const skippedResults = allResults.filter(r => r.distillSkipped);
+  if (skippedResults.length > 0) {
+    console.log(`\n  🚫 ${skippedResults.length} 个视频因资料不全跳过蒸馏：`);
+    for (const r of skippedResults) {
+      console.log(`     - ${r.videoId} (${r.info.desc?.substring(0, 30) || ''}): ${r.skipReason}`);
+    }
+  }
   if (validResults.length >= 1) {
     console.log('\n\n=== 阶段二：合并精炼输出（最强模型 + 思考模式）===\n');
 
@@ -496,18 +624,26 @@ async function main() {
   }
 
   // 统计
-  const success = allResults.filter(r => !r.error).length;
+  const done = allResults.filter(r => !r.error && !r.distillSkipped).length;
+  const skipped = allResults.filter(r => r.distillSkipped).length;
   const failed = allResults.filter(r => r.error).length;
-  console.log(`\n✅ 全部完成！成功: ${success}, 失败: ${failed}`);
+  console.log(`\n✅ 全部完成！`);
+  console.log(`   📊 资料齐全+蒸馏完成: ${done}`);
+  console.log(`   🚫 资料不全跳过蒸馏: ${skipped}`);
+  console.log(`   ❌ 下载/处理失败: ${failed}`);
   console.log(`📁 输出目录: ${outputDir}`);
+  console.log(`💾 原始视频保留在: ${VIDEO_KEEP_DIR}（等老板确认后再清理）`);
+  console.log(`💾 临时视频保留在: ${TMP_DIR}（等老板确认后再清理）`);
+  console.log(`💡 修好缺失的资料后，可以重新跑跳过蒸馏的视频`);
 }
 
 function saveProgress(results, outputDir) {
   const summary = results.map((r) => ({
     videoId: r.videoId,
     desc: r.info.desc || '',
-    status: r.error ? 'failed' : 'done',
-    error: r.error || null
+    status: r.error ? 'failed' : (r.distillSkipped ? 'skipped' : 'done'),
+    error: r.error || null,
+    skipReason: r.skipReason || null
   }));
   fs.writeFileSync(path.join(outputDir, '进度.json'), JSON.stringify(summary, null, 2), 'utf-8');
 }
