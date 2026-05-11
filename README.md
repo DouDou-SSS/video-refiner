@@ -6,6 +6,7 @@
 
 ## ✨ 核心特性
 
+- 🌐 **多平台支持** — 抖音 / B站 / 其他平台，自动智能路由
 - 🔒 **反检测下载** — 使用 [Camoufox](https://github.com/daijro/camoufox) 反检测浏览器，C++ 层指纹伪装
 - 🎙️ **语音转文字** — Whisper large-v3/medium 语音识别，自动根据视频时长切换模型
 - ✍️ **文案纠正** — [FunASR](https://github.com/modelscope/FunASR) CT-Transformer 本地模型自动添加标点和分段
@@ -32,21 +33,52 @@ pip install camoufox faster-whisper funasr rapidocr_onnxruntime
 python -m camoufox fetch
 ```
 
+### 平台下载工具（v6 新增）
+
+| 平台 | 工具 | 安装方式 |
+|------|------|---------|
+| **抖音** | mcporter (MCP 运行时) | `npm install -g mcporter` |
+| **抖音** | douyin-mcp-server | `pip install douyin-mcp-server` |
+| **B站** | yt-dlp | `pip install yt-dlp` |
+| **B站** | Chrome Cookie | yt-dlp 自动从 Chrome 读取 |
+
+> 未安装平台特定工具时，自动降级为 Camoufox 浏览器下载。
+
 ## 🚀 使用
+
+### 博主主页分析（推荐）
+
+```bash
+# 抖音博主
+node scripts/analyze_blogger.mjs --blogger "https://www.douyin.com/user/xxx"
+
+# B站博主
+node scripts/analyze_blogger.mjs --blogger "https://space.bilibili.com/xxx"
+
+# 指定输出目录
+node scripts/analyze_blogger.mjs --blogger "https://..." --output ~/Desktop/分析结果
+```
 
 ### 单视频分析
 
 ```bash
-node scripts/analyze_blogger.mjs <视频ID或链接> [--output <输出目录>]
+# 抖音视频
+node scripts/analyze_blogger.mjs "https://www.douyin.com/video/xxx"
+
+# B站视频
+node scripts/analyze_blogger.mjs "https://www.bilibili.com/video/BVxxx"
+
+# 其他平台
+node scripts/analyze_blogger.mjs "https://..."
 ```
 
 ### 批量分析
 
 创建视频链接文件 `videos.txt`：
 ```
-https://example.com/video/VIDEO_ID_1
-https://example.com/video/VIDEO_ID_2
-https://example.com/video/VIDEO_ID_3
+https://www.douyin.com/video/VIDEO_ID_1
+https://www.bilibili.com/video/BVxxx
+https://other-platform.com/VIDEO_ID_3
 ```
 
 ```bash
@@ -65,7 +97,9 @@ output/
 ├── 跨视频校验.md        # 一致性校验报告
 ├── 单视频分析/          # 每个视频各维度的独立分析
 ├── 文案/                # 语音转文字（已标点分段）
-└── 视频保留/            # 新手期保留原始视频
+├── 原始数据/            # 下载的视频文件
+├── 视频保留/            # 新手期保留原始视频
+└── 进度.json            # 处理进度记录
 ```
 
 ## 🎯 蒸馏维度
@@ -78,14 +112,22 @@ output/
 | **选题策略** | 内容定位、受众痛点、标题公式、系列化 |
 | **运营策略** | 发布节奏、互动方式、引流策略、商业化路径 |
 
-## 🔄 工作流程
+## 🔄 工作流程（v6）
 
 ```
-视频链接
+给博主主页链接 或 视频链接
     ↓
-Camoufox 反检测浏览器 → 平台 API → CDN 直链 → 下载
+blogger_parser.py 解析
+    ├── 抖音博主 → Camoufox 打开页面 + 监听 API + 滚动加载
+    ├── B站博主 → yt-dlp --flat-playlist --cookies-from-browser chrome
+    └── 其他博主 → Camoufox 通用解析（打开页面 + 滚动 + 提取链接）
     ↓
-ffmpeg 抽帧 + Whisper 语音识别
+download_router.py 智能下载路由器
+    ├── 抖音 → MCP 无水印下载（mcporter + douyin-mcp-server）
+    ├── B站 → yt-dlp 下载（支持 1080p，需 Chrome Cookie）
+    └── 其他 → Camoufox 直接下载
+    ↓
+ffmpeg 抽帧 + Whisper 语音识别（本地，常驻服务）
     ↓
 交叉验证：Whisper + 字幕 API + RapidOCR 硬字幕
     ↓
@@ -95,6 +137,14 @@ FunASR 本地模型 → 自动标点 + 分段
     ↓
 最强 LLM + 思考模式 → 合并精炼输出 → .md 文件
 ```
+
+## 🌐 平台支持
+
+| 平台 | 主页解析 | 视频下载 | 说明 |
+|------|---------|---------|------|
+| **抖音** | ✅ Camoufox | ✅ MCP 无水印 | 推荐，下载速度快且无水印 |
+| **B站** | ✅ yt-dlp | ✅ yt-dlp | 需 Chrome Cookie，支持 1080p |
+| **其他** | ✅ Camoufox | ✅ Camoufox | 通用方案，自动适配 |
 
 ## ⚙️ 模型要求
 
@@ -138,7 +188,15 @@ FunASR 本地模型 → 自动标点 + 分段
 - 需要配置代理访问国内平台 CDN
 - 单日建议不超过 50 个视频
 - 视频间建议保持 3-8 秒随机延迟
+- B站下载需要 Chrome 浏览器 Cookie（自动读取）
 
 ## 📄 许可证
 
 MIT License
+
+## 📝 版本历史
+
+- **v6 (2026-05-11)** — 新增多平台支持（抖音 MCP 无水印 / B站 yt-dlp），新增博主主页解析器
+- **v5.1 (2026-05-10)** — Mac mini Apple Silicon 调优：Whisper `compute_type=int8`，`medium` 模型最优
+- **v5 (2026-05-10)** — 常驻 Whisper 服务 + 蒸馏间隔延迟 + 保留视频不删除
+- **v4** — Camoufox 反检测 + 交叉验证 + 合并精炼输出

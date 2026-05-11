@@ -1,5 +1,6 @@
-// 视频创作者方法论蒸馏 - 多视频批量分析 v5
+// 视频创作者方法论蒸馏 - 多视频批量分析 v6
 // 基于 "同事.skill" 的隐性经验蒸馏方法论
+// v6: 智能下载路由器 + 多平台支持（抖音 MCP 无水印 / B站 yt-dlp / 其他 Camoufox）
 // v5: 常驻Whisper服务 + 蒸馏间隔延迟 + 保留视频不删除
 import fs from 'fs';
 import path from 'path';
@@ -16,6 +17,8 @@ const SCRIPTS_DIR = path.join(SKILL_DIR, 'scripts');
 const CAMOUFOX_PY = path.join(SCRIPTS_DIR, 'get_video_info.py');
 const CROSS_VALIDATE_PY = path.join(SCRIPTS_DIR, 'cross_validate.py');
 const WHISPER_SERVICE_PY = path.join(SCRIPTS_DIR, 'whisper_service.py');
+const DOWNLOAD_ROUTER_PY = path.join(SCRIPTS_DIR, 'download_router.py');
+const BLOGGER_PARSER_PY = path.join(SCRIPTS_DIR, 'blogger_parser.py');
 
 // Python 选择：系统python 用于 Whisper（模型已缓存，加载快），camoufox-env 用于 Camoufox
 const SYSTEM_PYTHON = '/opt/homebrew/bin/python3';
@@ -62,8 +65,9 @@ const client = new OpenAI({ apiKey, baseURL: 'https://coding.dashscope.aliyuncs.
 // 参数解析
 // ========================
 const args = process.argv.slice(2);
-let videoIds = [];
+let inputUrls = [];  // 输入的 URL 或 ID（可能是博主主页或单个视频）
 let outputDir = null;
+let isBloggerMode = false;
 
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--output' && i + 1 < args.length) {
@@ -71,24 +75,23 @@ for (let i = 0; i < args.length; i++) {
   } else if (args[i] === '--batch' && i + 1 < args.length) {
     const batchFile = args[++i];
     const links = fs.readFileSync(batchFile, 'utf-8').split('\n').filter(l => l.trim());
-    videoIds = links.map(l => {
-      const m = l.match(/modal_id=(\d+)/);
-      if (m) return m[1];
-      const m2 = l.match(/\/video\/(\d+)/);
-      if (m2) return m2[1];
-      return null;
-    }).filter(Boolean);
+    inputUrls = links;
+  } else if (args[i] === '--blogger') {
+    isBloggerMode = true;
   } else if (!args[i].startsWith('--')) {
-    const m = args[i].match(/modal_id=(\d+)/);
-    if (m) videoIds.push(m[1]);
-    else if (args[i].match(/\d{15,}/)) videoIds.push(args[i].match(/\d{15,}/)[0]);
-    else videoIds.push(args[i]);
+    inputUrls.push(args[i]);
   }
 }
 
-if (!videoIds.length) {
-  console.log('用法: node analyze_blogger.mjs <视频ID或链接> [--output <输出目录>]');
+if (!inputUrls.length) {
+  console.log('用法: node analyze_blogger.mjs <博主主页URL或视频链接> [--output <输出目录>]');
+  console.log('   或: node analyze_blogger.mjs --blogger <博主主页URL> [--output <输出目录>]');
   console.log('   或: node analyze_blogger.mjs --batch <链接文件> [--output <输出目录>]');
+  console.log('\n支持的输入:');
+  console.log('  - 抖音博主主页: https://www.douyin.com/user/...');
+  console.log('  - B站博主主页: https://space.bilibili.com/...');
+  console.log('  - 单个视频链接: https://www.douyin.com/video/... 或 https://www.bilibili.com/video/...');
+  console.log('  - 视频 ID: 15位以上数字ID 或 BV号');
   process.exit(1);
 }
 
@@ -98,7 +101,12 @@ if (videoIds.length > ANTI_BAN.dailyLimit) {
 }
 
 if (!outputDir) {
-  outputDir = path.join(process.env.HOME, 'Desktop', '博主分析_' + new Date().toISOString().slice(0, 10));
+  const dateStr = new Date().toISOString().slice(0, 10);
+  if (isBloggerMode) {
+    outputDir = path.join(process.env.HOME, 'Desktop', '博主分析_' + dateStr);
+  } else {
+    outputDir = path.join(process.env.HOME, 'Desktop', '视频分析_' + dateStr);
+  }
 }
 
 const TMP_DIR = path.join(outputDir, '原始数据');
@@ -109,6 +117,61 @@ fs.mkdirSync(TMP_DIR, { recursive: true });
 fs.mkdirSync(SINGLE_DIR, { recursive: true });
 fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true });
 fs.mkdirSync(VIDEO_KEEP_DIR, { recursive: true });
+
+// ========================
+// 博主主页解析（可选）
+// ========================
+async function parseBloggerUrls(urls) {
+  const allVideoUrls = [];
+
+  for (const url of urls) {
+    console.log(`\n🔍 解析输入: ${url.substring(0, 80)}...`);
+
+    try {
+      const result = execSync(`"${CAMOUFOX_PYTHON}" "${BLOGGER_PARSER_PY}" "${url}"`, {
+        timeout: 180000, stdio: ['pipe', 'pipe', 'inherit'], env: getEnv(),
+      }).toString().trim();
+
+      const parsed = JSON.parse(result);
+      if (parsed.error) {
+        console.log(`  ⚠️ 解析失败: ${parsed.error}`);
+        continue;
+      }
+
+      const videoIds = parsed.video_ids || [];
+      console.log(`  ✓ 找到 ${videoIds.length} 个视频`);
+
+      // 根据平台构造完整 URL
+      const isDouyin = url.includes('douyin.com');
+      const isBilibili = url.includes('bilibili.com');
+
+      for (const vid of videoIds) {
+        if (isDouyin) {
+          allVideoUrls.push(`https://www.douyin.com/video/${vid}`);
+        } else if (isBilibili) {
+          allVideoUrls.push(`https://www.bilibili.com/video/${vid}`);
+        } else {
+          allVideoUrls.push(url);  // 单个视频链接，直接用
+        }
+      }
+    } catch (e) {
+      console.log(`  ❌ 解析异常: ${e.message}`);
+    }
+  }
+
+  return allVideoUrls;
+}
+
+// 如果是博主模式或输入包含主页 URL，先解析获取视频列表
+let videoUrls = [];
+if (isBloggerMode || inputUrls.some(u => u.includes('/user/') || u.includes('space.bilibili.com'))) {
+  console.log('=== 解析博主主页获取视频列表 ===');
+  videoUrls = await parseBloggerUrls(inputUrls);
+  isBloggerMode = true;
+} else {
+  // 直接是视频链接或 ID
+  videoUrls = inputUrls;
+}
 
 // ========================
 // 工具函数
@@ -257,17 +320,20 @@ async function getVideoInfoCamoufox(videoId) {
 }
 
 // ========================
-// 下载视频
+// 下载视频（使用下载路由器）
 // ========================
-async function downloadVideo(videoUrl, outPath) {
-  const qUrl = videoUrl.replace(/"/g, '\\"');
-  const qPath = outPath.replace(/"/g, '\\"');
-  execSync(`curl -sL -o "${qPath}" "${qUrl}" -H "Referer: https://www.douyin.com/"`, {
-    timeout: 120000, stdio: 'pipe'
-  });
-  const size = fs.statSync(outPath).size;
-  if (size < 10000) throw new Error(`File too small (${(size/1024).toFixed(1)}KB)`);
-  return (size / 1024 / 1024).toFixed(2);
+async function downloadVideoWithRouter(videoUrl, outPath) {
+  console.log(`    🔄 智能下载路由器...`);
+  try {
+    const cmd = `"${SYSTEM_PYTHON}" "${DOWNLOAD_ROUTER_PY}" "${videoUrl}" --output "${outPath}" --camoufox-python "${CAMOUFOX_PYTHON}" --get-video-info-py "${CAMOUFOX_PY}"`;
+    const result = execSync(cmd, {
+      timeout: 180000, stdio: ['pipe', 'pipe', 'inherit'], env: getEnv(),
+    }).toString().trim();
+
+    return JSON.parse(result);
+  } catch (e) {
+    return { error: `下载失败: ${e.message}` };
+  }
 }
 
 // ========================
@@ -459,8 +525,17 @@ ${contextNote ? '注意：已有内容已在下方标注，你只需要合并新
 // 主流程
 // ========================
 async function main() {
-  console.log('=== 视频创作者方法论蒸馏 v5（常驻Whisper服务 + 蒸馏延迟 + 保留视频）===\n');
-  console.log(`视频数量: ${videoIds.length}`);
+  // 检查输入数量
+  const inputCount = isBloggerMode ? videoUrls.length : videoUrls.length;
+  if (inputCount === 0) {
+    console.log('❌ 未找到任何视频链接');
+    await stopWhisperService();
+    return;
+  }
+
+  console.log('=== 视频创作者方法论蒸馏 v6（智能下载路由器 + 多平台支持）===\n');
+  console.log(`视频数量: ${videoUrls.length}`);
+  console.log(`输入模式: ${isBloggerMode ? '博主主页解析' : '直接视频链接'}`);
   console.log(`输出目录: ${outputDir}`);
   console.log(`蒸馏模型: ${ANALYSIS_MODEL}（多模态）`);
   console.log(`合并模型: ${FINAL_MODEL} + 思考模式（备用: ${FINAL_MODEL_FALLBACK}）\n`);
@@ -480,10 +555,24 @@ async function main() {
     execSync(`"${CAMOUFOX_PYTHON}" -c "import camoufox"`, {
       stdio: ['pipe', 'pipe', 'pipe']
     }).toString().trim();
-    console.log('  ✅ Camoufox 已就绪（虚拟环境）\n');
+    console.log('  ✅ Camoufox 已就绪（虚拟环境）');
   } catch (e) {
-    console.log('  ❌ Camoufox 未安装');
-    return;
+    console.log('  ⚠️ Camoufox 未安装（非博主模式可继续）');
+  }
+
+  // 检查下载路由器依赖
+  console.log('  检查下载工具...');
+  try {
+    execSync('mcporter list', { stdio: ['pipe', 'pipe', 'pipe'] });
+    console.log('  ✅ MCP 已就绪（抖音无水印下载）');
+  } catch (e) {
+    console.log('  ⚠️ MCP 未配置（抖音将降级为 Camoufox 下载）');
+  }
+  try {
+    execSync('yt-dlp --version', { stdio: ['pipe', 'pipe', 'pipe'] });
+    console.log('  ✅ yt-dlp 已就绪（B站下载）');
+  } catch (e) {
+    console.log('  ⚠️ yt-dlp 未安装（B站下载不可用）');
   }
 
   // 启动常驻 Whisper 服务（一次加载，全程复用）
@@ -492,28 +581,43 @@ async function main() {
   const allResults = [];
 
   // 阶段一：逐视频分析
-  console.log('=== 阶段一：单视频多维度蒸馏 ===\n');
+  console.log('\n=== 阶段一：单视频多维度蒸馏 ===\n');
 
-  for (let i = 0; i < videoIds.length; i++) {
-    const videoId = videoIds[i];
-    console.log(`\n[${i + 1}/${videoIds.length}] 视频 ${videoId}...`);
+  for (let i = 0; i < videoUrls.length; i++) {
+    const videoUrl = videoUrls[i];
+    console.log(`\n[${i + 1}/${videoUrls.length}] 视频 ${videoUrl.substring(0, 60)}...`);
+
+    // 提取视频 ID 用于内部标识
+    const douyinIdMatch = videoUrl.match(/\/video\/(\d+)/) || videoUrl.match(/modal_id=(\d+)/);
+    const bilibiliIdMatch = videoUrl.match(/BV[\w]+/) || videoUrl.match(/av(\d+)/);
+    const videoId = douyinIdMatch ? douyinIdMatch[1] : (bilibiliIdMatch ? bilibiliIdMatch[0] : `video_${i+1}`);
 
     const videoPath = path.join(TMP_DIR, `${videoId}.mp4`);
     const framesDir = path.join(TMP_DIR, `${videoId}_frames`);
-    const result = { videoId, info: {}, transcript: null };
+    const result = { videoId, videoUrl, info: {}, transcript: null };
     for (const dim of DIMENSIONS) result[dim.name] = null;
 
     try {
-      // 获取视频信息
-      const info = await getVideoInfoCamoufox(videoId);
-      if (info.error || !info.playUrl) throw new Error(info.error || 'No CDN URL');
-      result.info = info;
-      const subNote = info.subtitleUrl ? '📝有字幕' : '📝无字幕';
-      console.log(`  ✓ 信息: ${info.desc?.substring(0, 50)} (${info.duration}s) ${subNote}`);
-
-      // 下载视频
-      const size = await downloadVideo(info.playUrl, videoPath);
-      console.log(`  ✓ 下载: ${size}MB`);
+      // 下载视频（使用下载路由器）
+      const downloadResult = await downloadVideoWithRouter(videoUrl, videoPath);
+      if (downloadResult.error) throw new Error(downloadResult.error);
+      
+      // 合并下载信息到 result.info
+      result.info = {
+        ...result.info,
+        ...downloadResult,
+        desc: downloadResult.desc || downloadResult.title || videoId,
+        author: downloadResult.author || '未知',
+        duration: downloadResult.duration || 0,
+        hashtags: downloadResult.hashtags || [],
+        subtitleUrl: downloadResult.subtitleUrl || 'none',
+        platform: downloadResult.platform || 'unknown',
+        method: downloadResult.method || 'unknown',
+      };
+      
+      console.log(`  ✓ 平台: ${result.info.platform} (${result.info.method})`);
+      console.log(`  ✓ 信息: ${result.info.desc?.substring(0, 50)} (${result.info.duration}s)`);
+      console.log(`  ✓ 下载: ${downloadResult.download_size_mb || '?'}MB`);
 
       // 抽帧
       const frames = await extractFrames(videoPath, framesDir);

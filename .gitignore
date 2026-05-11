@@ -20,3 +20,24 @@ Thumbs.db
 output/
 博主分析*/
 炼化输出*/
+test_download/
+
+# Video files (large, should not be committed)
+*.mp4
+*.mkv
+*.avi
+*.m4a
+*.mp3
+
+# Environment files
+.env
+.env.local
+*.env
+
+# Credentials
+credentials/
+*.key
+*.pem
+
+# Camoufox browser
+camoufox/
