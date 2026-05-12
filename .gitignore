@@ -41,3 +41,11 @@ credentials/
 
 # Camoufox browser
 camoufox/
+
+# GitNexus
+.gitnexus/
+.claude/
+
+# GitNexus auto-generated (should not be committed)
+AGENTS.md
+CLAUDE.md

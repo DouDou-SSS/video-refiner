@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """
-视频下载路由器 - 根据平台智能选择下载方式
+智能下载路由器 - 按平台自动选择最优下载方式
 
 用法:
-  python download_router.py <URL> --output <path.mp4>
+  python download_router.py <视频URL> [--output <输出路径>] [--opencli]
 
-平台判断:
-  - douyin.com     → MCP 下载无水印 (mcporter call douyin.get_douyin_download_link)
-  - bilibili.com   → yt-dlp 下载
-  - 其他           → Camoufox 浏览器直接下载（返回 CDN 链接后用 curl）
-
-输出: JSON 格式，包含平台、下载方式、视频信息
+平台路由:
+  - douyin.com → MCP 无水印下载 或 OpenCLI CDN 直链
+  - bilibili.com → yt-dlp 下载 或 OpenCLI 下载
+  - 其他 → Camoufox 浏览器直接下载
 """
 
 import sys
-import json
 import os
 import re
+import json
 import subprocess
-from pathlib import Path
 
 
 def detect_platform(url):
@@ -31,187 +28,294 @@ def detect_platform(url):
         return 'other'
 
 
-def get_douyin_info(video_url):
-    """抖音: 使用 MCP 服务器获取视频信息"""
+def check_opencli_available():
+    """检查 OpenCLI 是否可用"""
     try:
         result = subprocess.run(
-            ['mcporter', 'call', 'douyin.parse_douyin_video_info', f'share_link={video_url}'],
+            ['opencli', 'doctor'],
+            capture_output=True, text=True, timeout=10
+        )
+        output = result.stdout + result.stderr
+        ext_ok = 'Extension: connected' in output or '[OK] Extension:' in output
+        conn_ok = 'Connectivity: connected' in output or '[OK] Connectivity:' in output
+        return ext_ok and conn_ok
+    except:
+        return False
+
+
+def check_mcp_available():
+    """检查 MCP (mcporter) 是否可用"""
+    try:
+        result = subprocess.run(
+            ['mcporter', 'status'],
+            capture_output=True, text=True, timeout=10
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+
+def download_douyin_opencli(url, output_path):
+    """抖音 → OpenCLI CDN 直链下载"""
+    try:
+        # 提取 aweme_id
+        aweme_id_match = re.search(r'/video/(\d+)', url)
+        if not aweme_id_match:
+            return {'error': '无法提取 aweme_id', 'method': 'opencli'}
+        
+        aweme_id = aweme_id_match.group(1)
+        
+        # 获取 CDN 直链
+        result = subprocess.run(
+            ['opencli', 'douyin', 'user-videos', 'temp', '--limit', '1', '--format', 'json'],
             capture_output=True, text=True, timeout=30
         )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            inner = json.loads(data.get('result', '{}'))
-            return inner
-        else:
-            return {'error': f'MCP 调用失败: {result.stderr}'}
-    except Exception as e:
-        return {'error': f'MCP 调用异常: {str(e)}'}
-
-
-def download_douyin(video_url, out_path):
-    """抖音: MCP 下载无水印视频"""
-    print(f"  🟢 [MCP] 抖音无水印下载...", file=sys.stderr)
-
-    # 获取下载链接
-    info = get_douyin_info(video_url)
-    if info.get('error'):
-        return {'error': info['error']}
-
-    download_url = info.get('download_url')
-    if not download_url:
-        return {'error': 'MCP 未返回下载链接'}
-
-    # 使用 curl 下载
-    proxy = os.environ.get('http_proxy', '') or os.environ.get('https_proxy', '')
-    cmd = ['curl', '-sL', '-o', out_path, download_url, '-H', 'Referer: https://www.douyin.com/']
-    if proxy:
-        cmd = ['curl', '-sL', '-x', proxy, '-o', out_path, download_url, '-H', 'Referer: https://www.douyin.com/']
-
-    subprocess.run(cmd, check=True, timeout=120)
-
-    size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-    if size < 10000:
-        return {'error': f'文件太小 ({size/1024:.1f}KB)，可能下载失败'}
-
-    info['download_size_mb'] = round(size / 1024 / 1024, 2)
-    info['platform'] = 'douyin'
-    info['method'] = 'mcp'
-    return info
-
-
-def download_bilibili(video_url, out_path):
-    """B站: 使用 yt-dlp 下载"""
-    print(f"  🟡 [yt-dlp] B站视频下载...", file=sys.stderr)
-
-    # 提取 BV 号或 av 号
-    bv_match = re.search(r'BV[\w]+', video_url)
-    av_match = re.search(r'av(\d+)', video_url)
-
-    if not bv_match and not av_match:
-        return {'error': f'无法提取 B站视频 ID: {video_url}'}
-
-    video_id = bv_match.group(0) if bv_match else f'av{av_match.group(1)}'
-
-    proxy = os.environ.get('http_proxy', '') or os.environ.get('https_proxy', '')
-    cmd = [
-        'yt-dlp',
-        '-f', 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-        '-o', out_path,
-        '--no-playlist',
-        '--no-warnings',
-        '--merge-output-format', 'mp4',
-        video_url
-    ]
-    if proxy:
-        cmd.insert(2, '--proxy')
-        cmd.insert(3, proxy)
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            return {'error': f'yt-dlp 下载失败: {result.stderr[:500]}'}
-    except subprocess.TimeoutExpired:
-        return {'error': 'yt-dlp 下载超时'}
-
-    size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-    if size < 10000:
-        return {'error': f'文件太小 ({size/1024:.1f}KB)，可能下载失败'}
-
-    return {
-        'platform': 'bilibili',
-        'method': 'yt-dlp',
-        'video_id': video_id,
-        'download_size_mb': round(size / 1024 / 1024, 2),
-    }
-
-
-def download_other_with_camoufox(video_url, out_path, camoufox_python, get_video_info_py):
-    """其他平台: 使用 Camoufox 浏览器获取 CDN 链接后下载"""
-    print(f"  🔵 [Camoufox] 反检测浏览器获取下载链接...", file=sys.stderr)
-
-    # 从 URL 提取视频 ID（假设是抖音格式）
-    video_id_match = re.search(r'modal_id=(\d+)', video_url) or re.search(r'/video/(\d+)', video_url)
-    if not video_id_match:
-        return {'error': f'无法提取视频 ID: {video_url}'}
-
-    video_id = video_id_match.group(1)
-
-    try:
-        result = subprocess.run(
-            [camoufox_python, get_video_info_py, video_id],
-            capture_output=True, text=True, timeout=120
+        
+        # 通过 MCP 获取更准确的信息
+        mcp_result = subprocess.run(
+            ['mcporter', 'call', 'douyin.get_douyin_download_link', f'{{"aweme_id": "{aweme_id}"}}'],
+            capture_output=True, text=True, timeout=30
         )
-
-        if result.returncode != 0:
-            return {'error': f'Camoufox 获取失败: {result.stderr[:500]}'}
-
-        data = json.loads(result.stdout)
-        if not data or not isinstance(data, list) or len(data) == 0:
-            return {'error': 'Camoufox 返回空数据'}
-
-        info = data[0]
-        if info.get('error') or not info.get('playUrl'):
-            return {'error': info.get('error', 'No CDN URL')}
-
-        # 使用 curl 下载
-        download_url = info['playUrl']
-        proxy = os.environ.get('http_proxy', '') or os.environ.get('https_proxy', '')
-        cmd = ['curl', '-sL', '-o', out_path, download_url, '-H', 'Referer: https://www.douyin.com/']
-        if proxy:
-            cmd = ['curl', '-sL', '-x', proxy, '-o', out_path, download_url, '-H', 'Referer: https://www.douyin.com/']
-
-        subprocess.run(cmd, check=True, timeout=120)
-
-        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-        if size < 10000:
-            return {'error': f'文件太小 ({size/1024:.1f}KB)，可能下载失败'}
-
-        info['download_size_mb'] = round(size / 1024 / 1024, 2)
-        info['platform'] = 'other'
-        info['method'] = 'camoufox'
-        return info
-
+        
+        # 如果 MCP 可用，优先用 MCP
+        if mcp_result.returncode == 0:
+            try:
+                mcp_data = json.loads(mcp_result.stdout)
+                download_url = mcp_data.get('download_url', '')
+                if download_url:
+                    print(f'  🟢 [OpenCLI+MCP] 抖音无水印下载...', file=sys.stderr)
+                    proc = subprocess.run(
+                        ['curl', '-L', '-o', output_path, download_url],
+                        capture_output=True, timeout=300
+                    )
+                    if proc.returncode == 0 and os.path.getsize(output_path) > 1024:
+                        size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                        return {
+                            'video_id': aweme_id,
+                            'download_url': download_url,
+                            'output': output_path,
+                            'download_size_mb': round(size_mb, 2),
+                            'platform': 'douyin',
+                            'method': 'opencli+mcp'
+                        }
+            except:
+                pass
+        
+        # 如果 MCP 不可用，尝试 OpenCLI user-videos
+        # 这里需要知道 sec_uid，简化处理返回错误
+        return {'error': 'OpenCLI 抖音下载需要 sec_uid，建议使用 MCP', 'method': 'opencli'}
+        
     except Exception as e:
-        return {'error': f'Camoufox 下载异常: {str(e)}'}
+        return {'error': str(e), 'method': 'opencli'}
 
 
-def download(url, out_path, camoufox_python=None, get_video_info_py=None):
-    """统一下载入口"""
-    platform = detect_platform(url)
-    print(f"🎯 平台: {platform} | URL: {url[:60]}...", file=sys.stderr)
+def download_douyin_mcp(url, output_path):
+    """抖音 → MCP 无水印下载"""
+    try:
+        aweme_id_match = re.search(r'/video/(\d+)', url)
+        if not aweme_id_match:
+            return {'error': '无法提取 aweme_id', 'method': 'mcp'}
+        
+        aweme_id = aweme_id_match.group(1)
+        
+        # 获取下载链接
+        result = subprocess.run(
+            ['mcporter', 'call', 'douyin.get_douyin_download_link',
+             json.dumps({"aweme_id": aweme_id})],
+            capture_output=True, text=True, timeout=30
+        )
+        
+        if result.returncode != 0:
+            return {'error': result.stderr, 'method': 'mcp'}
+        
+        data = json.loads(result.stdout)
+        download_url = data.get('download_url', '')
+        
+        if not download_url:
+            return {'error': '未获取到下载链接', 'method': 'mcp'}
+        
+        # 下载视频
+        print(f'  🟢 [MCP] 抖音无水印下载...', file=sys.stderr)
+        proc = subprocess.run(
+            ['curl', '-L', '-o', output_path, download_url],
+            capture_output=True, timeout=300
+        )
+        
+        if proc.returncode == 0 and os.path.getsize(output_path) > 1024:
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            return {
+                'video_id': aweme_id,
+                'title': data.get('title', ''),
+                'download_url': download_url,
+                'output': output_path,
+                'status': 'success',
+                'download_size_mb': round(size_mb, 2),
+                'platform': 'douyin',
+                'method': 'mcp'
+            }
+        else:
+            return {'error': '下载失败或文件太小', 'method': 'mcp'}
+            
+    except Exception as e:
+        return {'error': str(e), 'method': 'mcp'}
 
-    if platform == 'douyin':
-        return download_douyin(url, out_path)
-    elif platform == 'bilibili':
-        return download_bilibili(url, out_path)
-    else:
-        if not camoufox_python or not get_video_info_py:
-            return {'error': '其他平台需要 Camoufox 环境，但未提供参数'}
-        return download_other_with_camoufox(url, out_path, camoufox_python, get_video_info_py)
+
+def download_bilibili_opencli(url, output_path):
+    """B站 → OpenCLI 下载"""
+    try:
+        # 提取 BV ID
+        bvid_match = re.search(r'(BV[A-Za-z0-9]{10})', url)
+        if not bvid_match:
+            return {'error': '无法提取 BV ID', 'method': 'opencli'}
+        
+        bvid = bvid_match.group(1)
+        
+        # 使用 opencli download
+        result = subprocess.run(
+            ['opencli', 'bilibili', 'download', bvid],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.path.dirname(output_path) or '.'
+        )
+        
+        if result.returncode == 0:
+            # 查找下载的文件
+            if os.path.exists(output_path):
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                return {
+                    'video_id': bvid,
+                    'output': output_path,
+                    'download_size_mb': round(size_mb, 2),
+                    'platform': 'bilibili',
+                    'method': 'opencli'
+                }
+        
+        # 如果直接下载失败，尝试 yt-dlp
+        return download_bilibili_ytdlp(url, output_path)
+        
+    except Exception as e:
+        return {'error': str(e), 'method': 'opencli'}
+
+
+def download_bilibili_ytdlp(url, output_path):
+    """B站 → yt-dlp 下载"""
+    try:
+        bvid_match = re.search(r'(BV[A-Za-z0-9]{10})', url)
+        if not bvid_match:
+            return {'error': '无法提取 BV ID', 'method': 'yt-dlp'}
+        
+        bvid = bvid_match.group(1)
+        proxy = os.environ.get('http_proxy', '') or os.environ.get('https_proxy', '')
+        
+        cmd = [
+            'yt-dlp',
+            '--cookies-from-browser', 'chrome',
+            '--no-warnings',
+            '-o', output_path,
+            url
+        ]
+        if proxy:
+            cmd.insert(2, '--proxy')
+            cmd.insert(3, proxy)
+        
+        print(f'  🟡 [yt-dlp] B站视频下载...', file=sys.stderr)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        
+        if os.path.exists(output_path):
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            return {
+                'platform': 'bilibili',
+                'method': 'yt-dlp',
+                'video_id': bvid,
+                'output': output_path,
+                'download_size_mb': round(size_mb, 2)
+            }
+        else:
+            return {'error': 'yt-dlp 下载失败', 'method': 'yt-dlp', 'stderr': result.stderr}
+            
+    except Exception as e:
+        return {'error': str(e), 'method': 'yt-dlp'}
+
+
+def download_other_camoufox(url, output_path):
+    """其他平台 → Camoufox 下载（保留原有逻辑）"""
+    try:
+        from camoufox.sync_api import Camoufox
+        
+        with Camoufox(headless=True) as browser:
+            context = browser.new_context()
+            page = context.new_page()
+            
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            
+            # 尝试获取视频 URL
+            video_url = page.evaluate('''() => {
+                const video = document.querySelector('video');
+                return video ? video.src : null;
+            }''')
+            
+            if video_url:
+                subprocess.run(['curl', '-L', '-o', output_path, video_url], timeout=300)
+                if os.path.exists(output_path):
+                    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                    return {
+                        'platform': 'other',
+                        'method': 'camoufox',
+                        'download_size_mb': round(size_mb, 2)
+                    }
+        
+        return {'error': 'Camoufox 未能获取视频 URL', 'method': 'camoufox'}
+        
+    except Exception as e:
+        return {'error': str(e), 'method': 'camoufox'}
 
 
 def main():
-    if len(sys.argv) < 4 or sys.argv[2] != '--output':
-        print("用法: python download_router.py <URL> --output <path.mp4>")
+    if len(sys.argv) < 2:
+        print(json.dumps({'error': '用法: python download_router.py <视频URL> [--output <路径>]'}))
         sys.exit(1)
-
+    
     url = sys.argv[1]
-    out_path = sys.argv[3]
-
-    # 可选参数
-    camoufox_python = None
-    get_video_info_py = None
+    platform = detect_platform(url)
+    
+    # 解析输出路径
+    output_path = None
     for i, arg in enumerate(sys.argv):
-        if arg == '--camoufox-python' and i + 1 < len(sys.argv):
-            camoufox_python = sys.argv[i + 1]
-        elif arg == '--get-video-info-py' and i + 1 < len(sys.argv):
-            get_video_info_py = sys.argv[i + 1]
-
-    result = download(url, out_path, camoufox_python, get_video_info_py)
+        if arg == '--output' and i + 1 < len(sys.argv):
+            output_path = sys.argv[i + 1]
+    
+    if not output_path:
+        # 默认输出路径
+        video_id_match = re.search(r'(BV[A-Za-z0-9]{10}|\d{15,})', url)
+        video_id = video_id_match.group(1) if video_id_match else 'video'
+        output_path = f'{platform}_{video_id}.mp4'
+    
+    print(f'🎯 平台: {platform} | URL: {url[:60]}...', file=sys.stderr)
+    
+    # 检查 OpenCLI 可用性
+    opencli_available = check_opencli_available()
+    
+    if platform == 'douyin':
+        # 抖音：优先 MCP，OpenCLI 需要 sec_uid
+        if check_mcp_available():
+            result = download_douyin_mcp(url, output_path)
+        elif opencli_available:
+            result = download_douyin_opencli(url, output_path)
+        else:
+            result = {'error': '抖音下载需要 MCP 或 OpenCLI', 'method': 'none'}
+    
+    elif platform == 'bilibili':
+        # B站：优先 OpenCLI（如果 Chrome 已开），否则 yt-dlp
+        if opencli_available:
+            print(f'  🟢 [OpenCLI] B站视频下载...', file=sys.stderr)
+            result = download_bilibili_opencli(url, output_path)
+        else:
+            result = download_bilibili_ytdlp(url, output_path)
+    
+    else:
+        # 其他平台
+        result = download_other_camoufox(url, output_path)
+    
     print(json.dumps(result, ensure_ascii=False, indent=2))
-
-    if result.get('error'):
-        sys.exit(1)
 
 
 if __name__ == '__main__':
