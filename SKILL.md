@@ -113,7 +113,10 @@ FunASR 本地模型 → 自动标点 + 分段
 - `compute_type="auto"` 在 Mac 上实际使用 float32，速度极慢（5 分钟视频需 16 分钟）
 - 必须显式指定 `compute_type="int8"`，速度提升近 5 倍
 - `large-v3` 在纯 CPU 上比 `medium` 更慢（参数量 2 倍），只在 GPU 下有优势
-- `whisper_service.py` 中已固定为 `int8`，不再使用 `auto`
+- 文案提取流程（v7 2026-05-15）：优先检测CC字幕和硬字幕OCR，有字幕时跳过Whisper，无字幕时才用Whisper转文字
+- 硬字幕OCR规则：1秒1帧（fps=1），数量不限，使用RapidOCR本地引擎
+- cross_validate.py 自动决定是否需要Whisper，优先使用字幕来源
+- Whisper 作为兜底方案，仅在无字幕时使用
 
 ## 防封策略
 

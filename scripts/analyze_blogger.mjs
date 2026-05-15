@@ -1,5 +1,6 @@
-// 视频创作者方法论蒸馏 - 多视频批量分析 v6.1
+// 视频创作者方法论蒸馏 - 多视频批量分析 v7
 // 基于 "同事.skill" 的隐性经验蒸馏方法论
+// v7: 优先使用字幕/OCR，无字幕时才用Whisper + OCR改为1秒1帧
 // v6.1: OpenCLI 集成（Chrome 扩展模式，获取评论/元数据）
 // v6: 智能下载路由器 + 多平台支持（抖音 MCP 无水印 / B站 yt-dlp / 其他 Camoufox）
 // v5: 常驻Whisper服务 + 蒸馏间隔延迟 + 保留视频不删除
@@ -291,14 +292,15 @@ async function downloadVideoWithRouter(videoUrl, outPath) {
 }
 
 // ========================
-// 抽帧
+// 抽帧（1秒1帧）
 // ========================
 async function extractFrames(videoPath, framesDir) {
   fs.mkdirSync(framesDir, { recursive: true });
   const qV = videoPath.replace(/"/g, '\\"');
   const qF = framesDir.replace(/"/g, '\\"');
-  const framePattern = `${qF}/frame_%03d.jpg`;
+  const framePattern = `${qF}/frame_%04d.jpg`;
   try {
+    // 1秒1帧（fps=1）
     execSync(`ffmpeg -i "${qV}" -vf "fps=1" -q:v 2 "${framePattern}" 2>&1`, {
       timeout: 60000, stdio: 'pipe'
     });
@@ -316,51 +318,50 @@ async function extractFrames(videoPath, framesDir) {
 }
 
 // ========================
-// 文案提取 + 交叉验证 + 标点分段
+// 文案提取 + 交叉验证（优先字幕/OCR，无字幕才用Whisper）
 // ========================
 async function extractAndValidateTranscript(videoPath, videoId, videoInfo, framesDir) {
   const whisperFile = path.join(TMP_DIR, `whisper_${videoId}.txt`);
+  const subtitleUrl = videoInfo.subtitleUrl || 'none';
 
-  // Step 1: Whisper 语音识别（使用常驻服务）
-  console.log(`    🎙️ Whisper 语音识别（常驻服务）...`);
+  // 抽帧（如果还没抽）
+  if (!fs.existsSync(framesDir) || fs.readdirSync(framesDir).length === 0) {
+    console.log(`    📸 抽帧（1秒1帧）...`);
+    await extractFrames(videoPath, framesDir);
+  }
+
+  console.log(`    🔍 检测字幕 + OCR（优先使用字幕/硬字幕，无字幕时才用Whisper）...`);
+
+  // 调用 cross_validate.py，它会自动：
+  //   1. 检测 CC 字幕
+  //   2. OCR 硬字幕（1秒1帧，数量不限）
+  //   3. 如果有字幕 → 跳过 Whisper，直接用字幕
+  //   4. 如果无字幕 → 先用 Whisper 转文字
+  //   5. FunASR 标点恢复
   try {
-    // 统一使用 medium（在 Apple Silicon 上比 large-v3 快 2-3 倍）
-    const model = 'medium';
-
-    const result = await whisperTranscribe(videoPath, videoId, model);
-
-    if (!result.ok) {
-      throw new Error(result.error);
-    }
-
-    const whisperText = result.text.trim();
-    if (!whisperText) return null;
-
-    fs.writeFileSync(whisperFile, whisperText, 'utf-8');
-    console.log(`    ✓ Whisper: ${whisperText.length}字`);
-
-    // Step 2: 交叉验证 + 标点分段
-    const subtitleUrl = videoInfo.subtitleUrl || 'none';
-    console.log(`    🔍 交叉验证 + 自动标点分段...`);
-
-    const corrected = execSync(`"${SYSTEM_PYTHON}" "${CROSS_VALIDATE_PY}" "${whisperFile}" "${subtitleUrl}" "${framesDir}" "${videoId}" "${videoInfo.desc || ''}" "${apiKey}"`, {
-      timeout: 300000, stdio: ['pipe', 'pipe', 'inherit'], env: getEnv(),
-    }).toString().trim();
+    const corrected = execSync(
+      `"${SYSTEM_PYTHON}" "${CROSS_VALIDATE_PY}" "${whisperFile}" "${subtitleUrl}" "${framesDir}" "${videoId}" "${videoInfo.desc || ''}" "${apiKey}"`,
+      { timeout: 600000, stdio: ['pipe', 'pipe', 'inherit'], env: getEnv() }
+    ).toString().trim();
 
     // 最后一行是修正后的文案（cross_validate.py 最后一行打印了纯文案）
     const correctedText = corrected.split('\n').filter(l => l.startsWith('[验证]')).length > 0
       ? corrected.split('[验证] 修正完成:')[1]?.split('\n').slice(1).join('\n').trim()
       : corrected.trim();
 
-    if (!correctedText) return whisperText; // fallback
-    console.log(`    ✓ 修正+标点: ${correctedText.length}字`);
+    if (!correctedText) {
+      console.log(`    ⚠️ 文案提取返回为空`);
+      return null;
+    }
+    console.log(`    ✓ 文案（已验证+标点）: ${correctedText.length}字`);
 
     return correctedText;
   } catch (e) {
     console.log(`    ⚠️ 文案提取失败: ${e.message}`);
-    // 清理
-    if (fs.existsSync(whisperFile)) fs.unlinkSync(whisperFile);
     return null;
+  } finally {
+    // 清理 Whisper 临时文件（如果生成了）
+    if (fs.existsSync(whisperFile)) fs.unlinkSync(whisperFile);
   }
 }
 
@@ -583,7 +584,7 @@ async function main() {
         transcript = await extractAndValidateTranscript(videoPath, videoId, result.info, framesDir);
         if (transcript) {
           const transcriptFile = path.join(TRANSCRIPT_DIR, `video_${videoId}.md`);
-          const mdContent = `# 视频文案 - ${videoId}\n\n> 标题：${result.info.desc || '未知'}\n> 作者：${result.info.author || '未知'}\n> 时长：${result.info.duration || '未知'}秒\n> 提取时间：${new Date().toLocaleString('zh-CN')}\n> 提取方式：Whisper + 交叉验证 + LLM标点分段\n\n---\n\n## 完整文案\n\n${transcript}\n`;
+          const mdContent = `# 视频文案 - ${videoId}\n\n> 标题：${result.info.desc || '未知'}\n> 作者：${result.info.author || '未知'}\n> 时长：${result.info.duration || '未知'}秒\n> 提取时间：${new Date().toLocaleString('zh-CN')}\n> 提取方式：字幕/OCR/Whisper + 交叉验证 + FunASR标点分段\n\n---\n\n## 完整文案\n\n${transcript}\n`;
           fs.writeFileSync(transcriptFile, mdContent, 'utf-8');
           console.log(`  ✓ 文案: ${transcript.length}字 → 永久保存`);
           result.transcript = transcript;
