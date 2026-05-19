@@ -72,28 +72,96 @@ def check_opencli_available():
         return False
 
 
+def parse_douyin_blogger_camoufox_api(sec_uid, limit=50):
+    """
+    抖音博主 → Camoufox 直接调 API 带 max_cursor 翻页，突破 OpenCLI --limit 20 上限
+    """
+    all_videos = []
+    max_cursor = '0'
+    page_num = 0
+
+    try:
+        with Camoufox(headless=True) as browser:
+            context = browser.new_context()
+            page = context.new_page()
+
+            # 先访问用户主页，让浏览器获取 cookies
+            page.goto(f'https://www.douyin.com/user/{sec_uid}', wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(3000)
+
+            while len(all_videos) < limit and page_num < 5:  # 最多翻5页，防死循环
+                page_num += 1
+                batch_size = min(20, limit - len(all_videos))
+
+                # 调用抖音 API，带 max_cursor 分页
+                api_url = (
+                    f'https://www.douyin.com/aweme/v1/web/aweme/post/?'
+                    f'sec_user_id={sec_uid}&max_cursor={max_cursor}'
+                    f'&count={batch_size}&aid=6383'
+                )
+
+                data = page.evaluate('''(url) => {
+                    return fetch(url, {
+                        headers: { 'Referer': 'https://www.douyin.com/' }
+                    }).then(r => r.json())
+                }''', api_url)
+
+                aweme_list = data.get('aweme_list', [])
+                has_more = data.get('has_more', False)
+                max_cursor = str(data.get('max_cursor', '0'))
+
+                if not aweme_list:
+                    break
+
+                for v in aweme_list:
+                    vid = v.get('aweme_id', '')
+                    if vid:
+                        all_videos.append({
+                            'video_id': vid,
+                            'title': v.get('desc', ''),
+                            'duration': round((v.get('video', {}).get('duration', 0)) / 1000),
+                            'digg_count': v.get('statistics', {}).get('digg_count', 0),
+                            'play_url': (v.get('video', {}).get('play_addr', {}).get('url_list', [''])[0]),
+                        })
+
+                if not has_more:
+                    break
+
+        return {'video_ids': all_videos[:limit], 'count': len(all_videos[:limit]), 'method': 'camoufox-api'}, None
+    except Exception as e:
+        return None, f"Camoufox API 分页失败: {e}"
+
+
 def parse_douyin_blogger_opencli(url, limit=50):
     """抖音博主 → OpenCLI 解析（首选）"""
     # 提取 sec_uid
     sec_uid_match = re.search(r'/user/([^?&]+)', url)
     if not sec_uid_match:
         return None, "无法提取 sec_uid"
-    
+
     sec_uid = sec_uid_match.group(1)
-    
+
+    # limit > 20 时，优先用 Camoufox API 分页（OpenCLI --limit 上限 20，无翻页参数）
+    if limit > 20:
+        print(f'[解析器] limit={limit} > 20，使用 Camoufox API 分页', file=sys.stderr)
+        result, err = parse_douyin_blogger_camoufox_api(sec_uid, limit)
+        if result:
+            return result, None
+        print(f'[解析器] Camoufox API 失败: {err}，降级到 OpenCLI（最多20个）', file=sys.stderr)
+
     try:
         result = subprocess.run(
-            ['opencli', 'douyin', 'user-videos', sec_uid, '--limit', str(limit), '--format', 'json'],
+            ['opencli', 'douyin', 'user-videos', sec_uid, '--limit', str(min(limit, 20)), '--format', 'json'],
             capture_output=True, text=True, timeout=60
         )
-        
+
         # 过滤非 JSON 输出
         json_start = result.stdout.find('[')
         if json_start < 0:
             return None, f"OpenCLI 返回异常: {result.stderr[:200]}"
-        
+
         data = json.loads(result.stdout[json_start:])
-        
+
         video_ids = []
         for v in data:
             video_ids.append({
@@ -104,9 +172,9 @@ def parse_douyin_blogger_opencli(url, limit=50):
                 'play_url': v.get('play_url', ''),
                 'top_comments': v.get('top_comments', [])
             })
-        
+
         return {'video_ids': video_ids, 'count': len(video_ids), 'method': 'opencli'}, None
-        
+
     except subprocess.TimeoutExpired:
         return None, "OpenCLI 超时"
     except Exception as e:

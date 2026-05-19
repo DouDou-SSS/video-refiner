@@ -87,27 +87,38 @@ def extract_video_id(url):
 
 def download_video(video_id, platform, output_dir):
     """
-    下载视频。复用现有 video-refiner 的下载脚本。
+    下载视频。复用 video-refiner 的 download_router.py。
     """
     scripts_dir = os.path.expanduser("~/.openclaw/workspace/skills/video-refiner/scripts/")
-    
-    # 先用 download_router.py 尝试智能下载
     download_router = os.path.join(scripts_dir, 'download_router.py')
+
+    # 构造完整 URL
+    if platform == 'douyin':
+        video_url = f'https://www.douyin.com/video/{video_id}'
+    elif platform == 'bilibili':
+        video_url = f'https://www.bilibili.com/video/{video_id}'
+    else:
+        # 未知平台，当作纯 ID 尝试
+        video_url = video_id
+
+    # 先用 download_router.py 尝试智能下载
     if os.path.exists(download_router):
         try:
             result = subprocess.run(
-                [SYSTEM_PYTHON, download_router, video_id, platform, output_dir],
+                [SYSTEM_PYTHON, download_router, video_url, '--output', os.path.join(output_dir, f'{video_id}.mp4')],
                 capture_output=True, text=True, timeout=300
             )
             if result.returncode == 0:
-                print(f"✅ 智能下载成功")
-                for line in result.stdout.split('\n'):
-                    if line.strip():
-                        print(f"   {line.strip()}")
-                return True
+                data = json.loads(result.stdout)
+                if not data.get('error'):
+                    video_path = os.path.join(output_dir, f'{video_id}.mp4')
+                    if os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+                        size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                        print(f"✅ 智能下载成功 ({size_mb:.1f}MB, method={data.get('method', 'unknown')})")
+                        return True
         except Exception as e:
             print(f"⚠️ 智能下载失败: {e}")
-    
+
     # 回退：Camoufox 获取
     get_video_info = os.path.join(scripts_dir, 'get_video_info.py')
     if os.path.exists(get_video_info):
@@ -118,7 +129,9 @@ def download_video(video_id, platform, output_dir):
             )
             if result.returncode == 0:
                 info = json.loads(result.stdout.strip())
-                cdn_url = info.get('cdn_url', '')
+                if isinstance(info, list) and len(info) > 0:
+                    info = info[0]
+                cdn_url = info.get('playUrl', '')
                 if cdn_url:
                     video_path = os.path.join(output_dir, f"{video_id}.mp4")
                     subprocess.run(
@@ -130,7 +143,7 @@ def download_video(video_id, platform, output_dir):
                         return True
         except Exception as e:
             print(f"⚠️ Camoufox 下载失败: {e}")
-    
+
     print(f"❌ 所有下载方式均失败")
     return False
 
@@ -152,47 +165,100 @@ def extract_frames(video_path, frames_dir, fps=1):
     return frame_count
 
 
-def extract_transcript(video_id, video_path, output_dir, raw_data_dir):
+def extract_transcript(video_id, video_path, output_dir, raw_data_dir, frames_dir, api_key, title=''):
     """
-    提取文案（v7 流程：优先字幕 → OCR → Whisper兜底）
-    复用 cross_validate.py
+    提取文案（v7 流程：优先字幕 → OCR → Whisper兜底 → FunASR标点恢复）
+
+    不依赖 cross_validate.py（该脚本期望预跑的 Whisper 文件，不适合独立运行场景）。
+    直接实现完整的字幕/OCR/Whisper 提取 + FunASR 标点恢复。
     """
-    scripts_dir = os.path.expanduser("~/.openclaw/workspace/skills/video-refiner/scripts/")
-    cross_validate = os.path.join(scripts_dir, 'cross_validate.py')
-    
-    if os.path.exists(cross_validate):
+    os.makedirs(raw_data_dir, exist_ok=True)
+    os.makedirs(frames_dir, exist_ok=True)
+
+    # --- 步骤1: 尝试 OCR 硬字幕 ---
+    print(f"  🔍 检测硬字幕 OCR（1秒1帧，RapidOCR 本地引擎）...")
+    ocr_text = ''
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        ocr_engine = RapidOCR()
+
+        frames = sorted([f for f in os.listdir(frames_dir) if f.endswith('.jpg')])
+        if frames:
+            all_texts = []
+            for frame_name in frames:
+                frame_path = os.path.join(frames_dir, frame_name)
+                result, _ = ocr_engine(frame_path)
+                if result:
+                    all_texts.extend([line[1] for line in result])
+
+            ocr_text = ' '.join(all_texts)
+            if ocr_text.strip():
+                # 保存 OCR 结果
+                with open(os.path.join(raw_data_dir, 'ocr_results.txt'), 'w', encoding='utf-8') as f:
+                    f.write(ocr_text)
+                print(f"  ✅ OCR 提取到 {len(ocr_text)} 字")
+            else:
+                print(f"  ⚠️ 未检测到硬字幕")
+    except ImportError:
+        print(f"  ⚠️ RapidOCR 未安装，跳过 OCR")
+
+    # --- 步骤2: 无字幕时使用 Whisper ---
+    whisper_text = ''
+    if not ocr_text.strip():
+        print(f"  🎙️ 无硬字幕，使用 Whisper 语音识别...")
         try:
-            result = subprocess.run(
-                [SYSTEM_PYTHON, cross_validate, video_id, video_path, raw_data_dir],
-                capture_output=True, text=True, timeout=600
-            )
-            if result.returncode == 0:
-                print(f"✅ 文案提取完成 (v7流程)")
-                for line in result.stdout.split('\n')[-5:]:
-                    if line.strip():
-                        print(f"   {line.strip()}")
-                # 文案文件
-                transcript_file = os.path.join(output_dir, 'transcript.md')
-                if os.path.exists(transcript_file):
-                    with open(transcript_file, 'r') as f:
-                        return f.read()
+            from faster_whisper import WhisperModel
+            model_size = 'medium'
+            model_path = os.path.expanduser(
+                f'~/.cache/huggingface/hub/models--Systran--faster-whisper-{model_size}')
+            if not os.path.exists(model_path):
+                model_size = 'base'
+
+            model = WhisperModel(model_size, device='cpu', compute_type='int8')
+            segments, _ = model.transcribe(video_path, beam_size=5, language='zh')
+            whisper_text = ' '.join([s.text for s in segments])
+            if whisper_text.strip():
+                print(f"  ✅ Whisper 提取到 {len(whisper_text)} 字")
         except Exception as e:
-            print(f"⚠️ cross_validate.py 失败: {e}")
-    
-    # 兜底：直接用 whisper_transcribe.py
-    whisper_transcribe = os.path.join(scripts_dir, 'whisper_transcribe.py')
-    if os.path.exists(whisper_transcribe):
-        try:
-            result = subprocess.run(
-                [SYSTEM_PYTHON, whisper_transcribe, video_path],
-                capture_output=True, text=True, timeout=600
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-        except Exception as e:
-            print(f"⚠️ whisper_transcribe.py 失败: {e}")
-    
-    return None
+            print(f"  ⚠️ Whisper 失败: {e}")
+    else:
+        print(f"  ✅ 使用 OCR 字幕，跳过 Whisper")
+
+    # 确定最终文本
+    main_text = ocr_text.strip() if ocr_text.strip() else whisper_text.strip()
+    if not main_text:
+        print(f"  ❌ 无任何文案来源")
+        return None
+
+    # --- 步骤3: FunASR 标点恢复 ---
+    print(f"  ✏️ FunASR 添加标点 + 分段...")
+    try:
+        from funasr import AutoModel
+        model_path = os.environ.get(
+            'FUNASR_PUNC_MODEL_PATH',
+            os.path.expanduser('~/.cache/modelscope/hub/models/damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch'))
+        if os.path.exists(model_path) or os.path.exists(os.path.expanduser('~/.cache/modelscope/hub/models/damo')):
+            model = AutoModel(model=model_path)
+            result = model.generate(input=main_text)
+            corrected = result[0]['text'] if isinstance(result, list) else result.get('text', '')
+            if corrected:
+                corrected_text = corrected
+            else:
+                corrected_text = main_text
+        else:
+            print(f"  ⚠️ FunASR 模型未下载，跳过标点恢复")
+            corrected_text = main_text
+    except Exception as e:
+        print(f"  ⚠️ FunASR 失败: {e}，使用原始文本")
+        corrected_text = main_text
+
+    # 保存文案
+    transcript_file = os.path.join(output_dir, 'transcript.md')
+    with open(transcript_file, 'w', encoding='utf-8') as f:
+        f.write(f"# 视频文案\n\n> 视频ID: {video_id}\n> 来源: {'OCR' if ocr_text.strip() else 'Whisper'} + FunASR标点\n\n---\n\n{corrected_text}\n")
+    print(f"  ✅ 文案已保存: transcript.md ({len(corrected_text)} 字)")
+
+    return corrected_text
 
 
 def extract_knowledge(transcript, frames_dir, frame_count, video_info, config):
@@ -347,6 +413,8 @@ def main():
     if not config['api_key']:
         print("❌ 未找到 API Key，请检查 ~/.openclaw/openclaw.json 或设置 DASHSCOPE_API_KEY")
         sys.exit(1)
+
+    video_title = args.title or ''
     
     # 1. 下载视频
     print(f"\n⬇️  步骤1: 下载视频")
@@ -369,7 +437,7 @@ def main():
     
     # 3. 提取文案
     print(f"\n📝 步骤3: 提取文案 (v7: 优先字幕 → OCR → Whisper)")
-    transcript = extract_transcript(video_id, video_path, str(output_base), str(raw_data_dir))
+    transcript = extract_transcript(video_id, video_path, str(output_base), str(raw_data_dir), str(frames_dir), config['api_key'], video_title)
     
     if transcript:
         with open(output_base / 'transcript.md', 'w') as f:
@@ -385,7 +453,7 @@ def main():
     video_info = {
         'video_id': video_id,
         'platform': platform,
-        'title': args.title or '',
+        'title': video_title,
         'frame_count': frame_count,
         'timestamp': timestamp,
     }
