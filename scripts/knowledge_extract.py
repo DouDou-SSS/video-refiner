@@ -379,6 +379,53 @@ def extract_knowledge(transcript, frames_dir, frame_count, video_info, config):
     return knowledge
 
 
+def classify_category(knowledge, title, config):
+    """用 LLM 判断知识提炼文档的分类目录名"""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=config['api_key'], base_url=config['base_url'])
+
+        # 提取分类规则：已有分类 + 新分类判断
+        obsidian_vault = Path(os.path.expanduser("~/Obsidian-Vault/知识库"))
+        existing_dirs = [d.name for d in obsidian_vault.iterdir() if d.is_dir() and not d.name.startswith('.')]
+
+        prompt = f"""你是一个知识分类专家。请根据以下内容判断分类目录名。
+
+已有分类目录：{', '.join(existing_dirs) if existing_dirs else '（暂无）'}
+
+视频标题：{title}
+
+知识提炼摘要（前1500字）：
+{knowledge[:1500]}
+
+要求：
+1. 如果内容适合已有分类，直接返回分类目录名（必须完全一致）
+2. 如果不适合任何已有分类，创建新的分类目录名（用中文，简洁）
+3. 只返回分类目录名，不要其他内容
+
+返回格式示例：Claude Code
+"""
+
+        resp = client.chat.completions.create(
+            model=config['model'],
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=50,
+            temperature=0.1,
+        )
+        category = resp.choices[0].message.content.strip().replace('/', '-').replace('\\', '-')
+
+        # 简单清理：去掉引号、括号等
+        category = category.strip('"\'`')
+        if len(category) > 30:
+            category = category[:30]
+
+        return category
+
+    except Exception as e:
+        print(f"⚠️ 分类失败: {e}")
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description='知识库提炼脚本')
     parser.add_argument('url_or_id', help='视频链接或视频ID')
@@ -459,17 +506,34 @@ def main():
     }
     
     knowledge = extract_knowledge(transcript, str(frames_dir), frame_count, video_info, config)
-    
-    if knowledge:
-        knowledge_file = output_base / '知识提炼.md'
-        with open(knowledge_file, 'w', encoding='utf-8') as f:
-            f.write(knowledge)
-        print(f"\n✅ 知识提炼完成!")
-        print(f"📄 输出文件: {knowledge_file}")
-    else:
+
+    if not knowledge:
         print("❌ 知识提炼失败")
         sys.exit(1)
-    
+
+    # 5. 分类判断 + 写入 Obsidian
+    print(f"\n📂 步骤5: 写入 Obsidian 知识库")
+    obsidian_vault = Path(os.path.expanduser("~/Obsidian-Vault/知识库"))
+    category = classify_category(knowledge, video_title, config)
+
+    if category:
+        target_dir = obsidian_vault / category
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_name = f"{video_title[:50].strip()}.md"
+        target_file = target_dir / file_name
+        with open(target_file, 'w', encoding='utf-8') as f:
+            f.write(knowledge)
+        print(f"✅ 已写入 Obsidian: {target_file}")
+        print(f"📂 分类: {category}")
+    else:
+        print("⚠️ 分类判断失败，仅保存到原始输出目录")
+
+    # 同时保留本地原始文件
+    knowledge_file = output_base / '知识提炼.md'
+    with open(knowledge_file, 'w', encoding='utf-8') as f:
+        f.write(knowledge)
+    print(f"📄 本地副本: {knowledge_file}")
+
     print(f"\n📂 知识库目录: {output_base}")
     print("   ├── frames/          ← 抽帧图片")
     print("   ├── 知识提炼.md       ← 最终知识文档")
