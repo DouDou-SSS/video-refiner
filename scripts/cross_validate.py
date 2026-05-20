@@ -7,6 +7,8 @@
 修改日志:
 2026-05-15: 改为优先使用辅助字幕/硬字幕OCR，无字幕时才用Whisper
            OCR改为1秒1帧，数量不限
+2026-05-20: 新增OCR相邻帧自动去重，防止同字幕重复识别（从37万字压缩到几万字）
+           OCR文本过长时跳过FunASR（会超时）
 """
 
 import sys
@@ -45,7 +47,7 @@ def clean_subtitle_text(text):
 def get_cc_subtitle():
     """获取辅助字幕（CC字幕）"""
     subtitle_texts = []
-    
+
     # 方式A: 本地字幕文件
     if subtitle_arg and subtitle_arg != 'none' and os.path.exists(subtitle_arg):
         with open(subtitle_arg, 'r', encoding='utf-8') as f:
@@ -54,7 +56,7 @@ def get_cc_subtitle():
         if text:
             subtitle_texts.append(text)
             print(f'[验证] ✅ 辅助字幕文件: {len(text)}字', file=sys.stderr)
-    
+
     # 方式B: 下载字幕 URL
     elif subtitle_arg and subtitle_arg.startswith('http'):
         try:
@@ -74,58 +76,69 @@ def get_cc_subtitle():
                 print(f'[验证] ✅ 辅助字幕URL: {len(text)}字', file=sys.stderr)
         except Exception as e:
             print(f'[验证] ⚠️ 辅助字幕URL下载失败: {e}', file=sys.stderr)
-    
+
     return '\n'.join(subtitle_texts)
 
 def get_hard_subtitle_ocr():
-    """硬字幕OCR — 1秒1帧，数量不限"""
+    """硬字幕OCR — 1秒1帧，自动去重相邻帧的重复字幕"""
     if not os.path.isdir(frames_dir):
         return ''
-    
+
     frames = [f for f in os.listdir(frames_dir) if f.endswith('.jpg')]
     frames.sort()
-    
+
     if not frames:
         return ''
-    
-    # 1秒1帧（30fps视频约30帧/秒，取每30帧的1帧）
-    # 假设视频是30fps，则每秒1帧 = 每隔30帧取1帧
-    # 为保险，用 ffmpeg 抽帧时已经是 fps=1，所以直接全部处理
-    ocr_frames = frames
-    
-    print(f'[验证] OCR: 对 {len(ocr_frames)} 帧提取硬字幕（1秒1帧，RapidOCR 本地引擎）...', file=sys.stderr)
-    
+
+    print(f'[验证] OCR: 对 {len(frames)} 帧提取硬字幕（1秒1帧，RapidOCR 本地引擎，自动去重）...', file=sys.stderr)
+
     try:
         from rapidocr_onnxruntime import RapidOCR
         ocr_engine = RapidOCR()
     except ImportError:
         print(f'[验证] ⚠️ OCR: RapidOCR 未安装', file=sys.stderr)
         return ''
-    
+
     all_texts = []
     frames_with_text = 0
-    start = time.time()
-    
-    for i, frame_name in enumerate(ocr_frames):
+    skipped_duplicates = 0
+    last_text = ''
+    t0 = time.time()
+
+    for i, frame_name in enumerate(frames):
         frame_path = os.path.join(frames_dir, frame_name)
         result, elapse = ocr_engine(frame_path)
         texts = [line[1] for line in (result or [])]
         if texts:
             frames_with_text += 1
+            frame_text = ' '.join(texts)
+            # 与上一帧文本做相似度比较，重复则跳过
+            if frame_text == last_text:
+                skipped_duplicates += 1
+                continue
+            # 更宽松：85% 以上字符相同视为重复
+            if len(last_text) > 20 and len(frame_text) > 20:
+                common = len(set(frame_text) & set(last_text)) / max(len(frame_text), len(last_text))
+                if common > 0.85:
+                    skipped_duplicates += 1
+                    continue
+            last_text = frame_text
             all_texts.extend(texts)
-        
+        else:
+            last_text = ''  # 无字幕帧重置比较基准
+
         # 进度日志（每50帧打印一次）
         if (i + 1) % 50 == 0:
-            print(f'[验证]   OCR进度: {i+1}/{len(ocr_frames)} 帧 ({frames_with_text}帧有字幕)...', file=sys.stderr)
-    
-    elapsed = time.time() - start
+            print(f'[验证]   OCR进度: {i+1}/{len(frames)} 帧 ({frames_with_text}帧有字幕, 跳过{skipped_duplicates}帧重复)...', file=sys.stderr)
+
+    elapsed = time.time() - t0
     ocr_text = ' '.join(all_texts)
-    
+
     if ocr_text.strip():
-        print(f'[验证] ✅ 硬字幕OCR完成: {frames_with_text}/{len(ocr_frames)}帧有字幕, {len(ocr_text)}字, 耗时{elapsed:.1f}s', file=sys.stderr)
+        print(f'[验证] ✅ 硬字幕OCR完成: {frames_with_text}/{len(frames)}帧有字幕, 跳过{skipped_duplicates}帧重复, {len(ocr_text)}字, 耗时{elapsed:.1f}s', file=sys.stderr)
     else:
-        print(f'[验证] ⚠️ OCR: 未检测到硬字幕 ({frames_with_text}/{len(ocr_frames)}帧)', file=sys.stderr)
-    
+        print(f'[验证] ⚠️ OCR: 未检测到硬字幕 ({frames_with_text}/{len(frames)}帧)', file=sys.stderr)
+
     return ocr_text
 
 # ========================
@@ -190,7 +203,7 @@ print(f'[验证] 本地模型添加标点 + 分段...', file=sys.stderr)
 def add_punctuation_local(text):
     """用 FunASR 本地标点模型添加标点"""
     from funasr import AutoModel
-    
+
     model_path = os.environ.get(
         'FUNASR_PUNC_MODEL_PATH',
         os.path.expanduser('~/.cache/modelscope/hub/models/damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch')
@@ -200,7 +213,14 @@ def add_punctuation_local(text):
     punctuated = result[0]['text'] if isinstance(result, list) else result.get('text', '')
     return punctuated
 
-corrected_text = add_punctuation_local(main_text)
+# OCR 文本通常超过 5 万字（逐帧重复识别），FunASR 无法处理，直接跳过标点恢复
+OCR_FUNASR_LIMIT = 50000
+
+if len(main_text) > OCR_FUNASR_LIMIT and source == '字幕/OCR':
+    print(f'[验证] ⚠️ OCR 文本过长 ({len(main_text)}字 > {OCR_FUNASR_LIMIT})，跳过 FunASR（会超时）', file=sys.stderr)
+    corrected_text = main_text
+else:
+    corrected_text = add_punctuation_local(main_text)
 
 print(f'[验证] 修正完成: {len(corrected_text)}字')
 print(corrected_text)
