@@ -8,13 +8,15 @@
 
 - 🌐 **多平台支持** — 抖音 / B站 / 其他平台，自动智能路由
 - 🔒 **反检测下载** — 使用 [Camoufox](https://github.com/daijro/camoufox) 反检测浏览器，C++ 层指纹伪装
+- ⚡ **抖音博主抓取突破**（v8 新增）— 用 OpenCLI DOM eval 一次拿 50+ 个视频，绕过抖音 API 签名反爬
 - **优先字幕**：有 CC 字幕或硬字幕时，直接使用字幕文本，跳过 Whisper 转文字
 - **兜底方案**：无字幕时才使用 Whisper medium 语音识别
 - ✍️ **文案纠正** — [FunASR](https://github.com/modelscope/FunASR) CT-Transformer 本地模型自动添加标点和分段
 - 🔍 **硬字幕 OCR** — [RapidOCR](https://github.com/RapidAI/RapidOCR) 本地引擎提取画面字幕，1秒1帧全覆盖
 - 📊 **多维度蒸馏** — 5 个专用 Prompt 分别分析创作方法论的 5 个维度
 - 🧠 **合并精炼** — 最强 LLM + 思考模式，合并所有视频分析为精炼的 .md 文件
-- 📚 **知识库提炼**（v7.1 新增）— 从视频中提取知识内容，不做创作手法分析，输出结构化知识文档
+- 📚 **知识库提炼**（v7.1）— 从视频中提取知识内容，不做创作手法分析，输出结构化知识文档
+- 📂 **Obsidian 同步**（v8 新增）— `sync_to_obsidian.py` 自动将本地知识库同步到 Obsidian Vault，含 LLM 自动分类
 
 ## 📦 安装
 
@@ -185,10 +187,12 @@ knowledge_{videoId}_{timestamp}/
 
 | 平台 | 主页解析 | 视频下载 | 元数据 | 评论 |
 |------|---------|---------|--------|------|
-| **抖音** | ✅ OpenCLI / Camoufox | ✅ MCP / OpenCLI | ✅ | ✅ |
+| **抖音** | ⭐ OpenCLI DOM eval / OpenCLI / Camoufox | ✅ MCP / OpenCLI | ✅ | ✅ |
 | **B站** | ✅ OpenCLI / yt-dlp | ✅ OpenCLI / yt-dlp | ✅ | ✅ |
 | **其他** | ✅ Camoufox | ✅ Camoufox | ❌ |  |
 
+> **v8 重大突破**：抖音博主主页根本不需要调 API，用 `opencli browser open + eval` 直接从 DOM 拿 50+ 个视频，绕过所有反爬。
+>
 > OpenCLI 需要 Chrome 浏览器 + 扩展实时连接，适合手动触发场景（你在电脑前时）。后台全自动运行时自动降级到 Camoufox/yt-dlp。
 
 ## ⚙️ 模型要求

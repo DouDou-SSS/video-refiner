@@ -7,9 +7,9 @@ import sys
 import json
 from pathlib import Path
 
-# 配置
-LOCAL_KB = Path("~/VideoAutomation/知识库")
-OBSIDIAN_VAULT = Path(os.path.expanduser("~/Obsidian-Vault/知识库"))
+# 配置（支持环境变量覆盖，默认值用通用化路径）
+LOCAL_KB = Path(os.environ.get('VIDEO_REFINER_LOCAL_KB', os.path.expanduser('~/VideoAutomation/知识库')))
+OBSIDIAN_VAULT = Path(os.environ.get('VIDEO_REFINER_OBSIDIAN_VAULT', os.path.expanduser('~/Obsidian-Vault/知识库')))
 
 # 需要排除的文件
 EXCLUDE_FILES = {'knowledge_extract.py', 'cross_validate.py', '知识提炼.md'}

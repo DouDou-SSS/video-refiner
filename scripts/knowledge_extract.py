@@ -385,8 +385,8 @@ def classify_category(knowledge, title, config):
         from openai import OpenAI
         client = OpenAI(api_key=config['api_key'], base_url=config['base_url'])
 
-        # 提取分类规则：已有分类 + 新分类判断
-        obsidian_vault = Path(os.path.expanduser("~/Obsidian-Vault/知识库"))
+        # 提取分类规则：已有分类 + 新分类判断（路径可通过环境变量 VIDEO_REFINER_OBSIDIAN_VAULT 覆盖）
+        obsidian_vault = Path(os.environ.get('VIDEO_REFINER_OBSIDIAN_VAULT', os.path.expanduser('~/Obsidian-Vault/知识库')))
         existing_dirs = [d.name for d in obsidian_vault.iterdir() if d.is_dir() and not d.name.startswith('.')]
 
         prompt = f"""你是一个知识分类专家。请根据以下内容判断分类目录名。
@@ -513,7 +513,7 @@ def main():
 
     # 5. 分类判断 + 写入 Obsidian
     print(f"\n📂 步骤5: 写入 Obsidian 知识库")
-    obsidian_vault = Path(os.path.expanduser("~/Obsidian-Vault/知识库"))
+    obsidian_vault = Path(os.environ.get('VIDEO_REFINER_OBSIDIAN_VAULT', os.path.expanduser('~/Obsidian-Vault/知识库')))
     category = classify_category(knowledge, video_title, config)
 
     if category:
