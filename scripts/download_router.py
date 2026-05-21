@@ -46,8 +46,9 @@ def check_opencli_available():
 def check_mcp_available():
     """检查 MCP (mcporter) 是否可用"""
     try:
+        # mcporter 没有 status 子命令，用 --version 检测安装即可
         result = subprocess.run(
-            ['mcporter', 'status'],
+            ['mcporter', '--version'],
             capture_output=True, text=True, timeout=10
         )
         return result.returncode == 0
@@ -71,16 +72,22 @@ def download_douyin_opencli(url, output_path):
             capture_output=True, text=True, timeout=30
         )
         
-        # 通过 MCP 获取更准确的信息
+        # 通过 MCP 获取更准确的信息（新版 MCP 用 --share_link 传 URL）
         mcp_result = subprocess.run(
-            ['mcporter', 'call', 'douyin.get_douyin_download_link', f'{{"aweme_id": "{aweme_id}"}}'],
+            ['mcporter', 'call', 'douyin.get_douyin_download_link',
+             '--share_link', url],
             capture_output=True, text=True, timeout=30
         )
         
         # 如果 MCP 可用，优先用 MCP
         if mcp_result.returncode == 0:
             try:
-                mcp_data = json.loads(mcp_result.stdout)
+                # 响应是嵌套的 JSON：外层 {result: "JSON字符串"}
+                raw = json.loads(mcp_result.stdout)
+                if 'result' in raw and isinstance(raw['result'], str):
+                    mcp_data = json.loads(raw['result'])
+                else:
+                    mcp_data = raw
                 download_url = mcp_data.get('download_url', '')
                 if download_url:
                     print(f'  🟢 [OpenCLI+MCP] 抖音无水印下载...', file=sys.stderr)
@@ -115,22 +122,28 @@ def download_douyin_mcp(url, output_path):
         aweme_id_match = re.search(r'/video/(\d+)', url)
         if not aweme_id_match:
             return {'error': '无法提取 aweme_id', 'method': 'mcp'}
-        
+
         aweme_id = aweme_id_match.group(1)
-        
-        # 获取下载链接
+
+        # 获取下载链接（新版 MCP 用 --share_link 传 URL，不是 JSON）
         result = subprocess.run(
             ['mcporter', 'call', 'douyin.get_douyin_download_link',
-             json.dumps({"aweme_id": aweme_id})],
+             '--share_link', url],
             capture_output=True, text=True, timeout=30
         )
-        
+
         if result.returncode != 0:
             return {'error': result.stderr, 'method': 'mcp'}
-        
-        data = json.loads(result.stdout)
+
+        # 响应是嵌套的 JSON：外层 {result: "JSON字符串"}
+        raw = json.loads(result.stdout)
+        if 'result' in raw and isinstance(raw['result'], str):
+            data = json.loads(raw['result'])
+        else:
+            data = raw
+
         download_url = data.get('download_url', '')
-        
+
         if not download_url:
             return {'error': '未获取到下载链接', 'method': 'mcp'}
         
