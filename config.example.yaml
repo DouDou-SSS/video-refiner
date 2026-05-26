@@ -1,0 +1,22 @@
+# 视频炼化本机配置示例
+# 首次运行 install.command 会在 ~/.video-refiner/config.yaml 生成真实配置。
+
+database_path: ~/.video-refiner/video-refiner.sqlite3
+output_root: ~/Desktop/视频炼化输出
+prompts_dir: ./prompts
+system_python: ./webapp/backend/.venv/bin/python
+camoufox_python: ./webapp/backend/.venv/bin/python
+ffmpeg_bin: ffmpeg
+
+daily_limit: 50
+video_delay_min_ms: 3000
+video_delay_max_ms: 8000
+dimension_delay_min_ms: 10000
+dimension_delay_max_ms: 20000
+auto_retry_max_attempts: 3
+auto_retry_delay_min_ms: 60000
+auto_retry_delay_max_ms: 180000
+frame_fps: 1
+max_dimension_frames: 20
+max_analysis_chars_per_video: 60000
+max_merge_chars_per_video: 500

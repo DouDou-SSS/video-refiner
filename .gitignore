@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
+webapp/frontend/node_modules/
+webapp/frontend/dist/
 venv/
+.venv/
 *.egg-info/
 
 # Python cache
@@ -21,6 +24,12 @@ output/
 博主分析*/
 炼化输出*/
 test_download/
+webapp/data/
+webapp/*.png
+webapp/node-tools/
+dist_portable/
+*.sqlite
+*.sqlite3
 
 # Video files (large, should not be committed)
 *.mp4
@@ -38,6 +47,7 @@ test_download/
 credentials/
 *.key
 *.pem
+scripts/rerun_*.mjs
 
 # Camoufox browser
 camoufox/

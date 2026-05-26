@@ -4,6 +4,23 @@
 
 > **核心理念**：不是整理"视频讲了什么"，而是提炼"创作者是怎么做的" → 可复用的创作方法论
 
+## 🖥️ 本地 Web 软件化 v1
+
+新增本机 Web 版本，入口在 `webapp/`。它把原先由智能体临场执行的脚本流程固定为状态机，并提供模型供应商配置、API Key 安全存储、预检、实时日志、失败重试和产物查看。
+
+```bash
+cd /path/to/video-refiner
+python3 -m venv webapp/backend/.venv
+webapp/backend/.venv/bin/python -m pip install -r webapp/backend/requirements.txt
+cd webapp/frontend && npm install && npm run build
+cd /path/to/video-refiner
+PYTHONPATH=webapp/backend webapp/backend/.venv/bin/python -m uvicorn videorefiner_app.main:app --host 127.0.0.1 --port 7860
+```
+
+打开：`http://127.0.0.1:7860`
+
+详细说明见 `webapp/README.md`。旧 `scripts/` 仍保留为历史参考，Web v1 不再以 `scripts/analyze_blogger.mjs` 作为主入口。
+
 ## ✨ 核心特性
 
 - 🌐 **多平台支持** — 抖音 / B站 / 其他平台，自动智能路由
