@@ -10,6 +10,8 @@ VENV_DIR="$BACKEND_DIR/.venv"
 PYTHON_BIN="$VENV_DIR/bin/python"
 CONFIG_PATH="${VIDEO_REFINER_CONFIG:-$APP_HOME/config.yaml}"
 WHISPER_MODEL_DIR="$ROOT_DIR/models/whisper/faster-whisper-tiny"
+CAMOUFOX_VENDOR_DIR="$ROOT_DIR/vendor/camoufox"
+CAMOUFOX_CACHE_DIR="$HOME/Library/Caches/camoufox"
 HOST_PYTHON=""
 export PATH="$NODE_TOOLS_DIR/node_modules/.bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
@@ -231,7 +233,23 @@ PY
 
 install_camoufox_browsers() {
   log "安装 Camoufox 浏览器运行文件"
-  "$PYTHON_BIN" -m camoufox fetch
+  if [[ -d "$CAMOUFOX_CACHE_DIR/Camoufox.app" ]]; then
+    echo "Camoufox 浏览器运行文件已就绪：$CAMOUFOX_CACHE_DIR/Camoufox.app"
+    return
+  fi
+  if [[ -d "$CAMOUFOX_VENDOR_DIR/Camoufox.app" ]]; then
+    mkdir -p "$CAMOUFOX_CACHE_DIR"
+    rsync -a "$CAMOUFOX_VENDOR_DIR/Camoufox.app" "$CAMOUFOX_CACHE_DIR/"
+    if [[ -f "$CAMOUFOX_VENDOR_DIR/version.json" ]]; then
+      rsync -a "$CAMOUFOX_VENDOR_DIR/version.json" "$CAMOUFOX_CACHE_DIR/"
+    fi
+    echo "已从软件包内置缓存安装 Camoufox：$CAMOUFOX_CACHE_DIR/Camoufox.app"
+    return
+  fi
+  if ! "$PYTHON_BIN" -m camoufox fetch; then
+    echo "Camoufox 浏览器运行文件安装失败。请检查网络能否访问 GitHub，或使用包含 vendor/camoufox/Camoufox.app 的完整软件包。"
+    exit 1
+  fi
 }
 
 build_frontend_if_needed() {

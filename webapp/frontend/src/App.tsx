@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   BarChart3,
@@ -83,10 +83,41 @@ const CLEANUP_OPTIONS: Array<{ key: CleanupCategory; label: string; description:
 const PIPELINE_STEPS = [
   ['01', '环境预检', '确认 ffmpeg、Whisper、OCR、下载组件和模型配置可用。'],
   ['02', '解析与下载', '解析单视频、批量链接或博主主页，按阶梯方案下载视频。'],
-  ['03', '抽帧与文案', '固定抽帧；文案优先软字幕，其次 Whisper，OCR 只做校对辅助。'],
+  ['03', '抽帧与文案', '按默认策略或自定义间隔抽帧；文案优先软字幕，其次 Whisper，OCR 只做校对辅助。'],
   ['04', '资料检查', '跳过资料不完整的视频，失败进入明确状态并支持自动重试。'],
   ['05', '5 维炼化', '单视频蒸馏后跨视频合并，产出 5 份兼容旧结构的文档。'],
+  ['06', '结构化知识库', '生成 creator profile、pattern library、QA checklist、video cards 和 retrieval pack。'],
 ];
+
+const VISIBLE_ARTIFACT_KINDS = [
+  'final_output',
+  'benchmark_profile',
+  'benchmark_pattern_library',
+  'benchmark_qa_checklist',
+  'retrieval_index',
+  'retrieval_pack',
+  'raw_refs',
+  'manifest',
+  'progress',
+];
+
+const ARTIFACT_LABELS: Record<string, string> = {
+  final_output: '旧版 5 维文档',
+  benchmark_profile: 'Creator Profile',
+  benchmark_pattern_library: 'Pattern Library',
+  benchmark_qa_checklist: 'QA Checklist',
+  retrieval_index: 'Retrieval Index',
+  retrieval_pack: 'Retrieval Pack',
+  raw_refs: 'Raw 引用',
+  manifest: 'Manifest',
+  progress: '进度',
+};
+
+const CUSTOM_FRAME_INTERVAL_DEFAULT_SECONDS = 5;
+const FRAME_ESTIMATE_DURATIONS = [5, 10, 20, 30, 50];
+const ESTIMATED_FRAME_BYTES = 220 * 1024;
+const MODEL_DIMENSION_COUNT = 5;
+const MODEL_MAX_FRAMES_PER_DIMENSION = 20;
 
 const emptyCleanupSelection = (): Record<CleanupCategory, boolean> => ({
   frames: false,
@@ -202,13 +233,32 @@ function computeJobProgress(job: Job) {
 function visibleArtifacts(job: Job) {
   const seen = new Set<string>();
   return (job.artifacts || [])
-    .filter((item) => ['final_output', 'manifest', 'progress'].includes(item.kind))
+    .filter((item) => VISIBLE_ARTIFACT_KINDS.includes(item.kind))
     .filter((item) => {
       const key = `${item.kind}:${item.path}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
+}
+
+function latestJobsByOutputDir(jobs: Job[]) {
+  const seen = new Set<string>();
+  const result: Job[] = [];
+  for (const job of jobs) {
+    const key = displayJobName(job.output_dir || job.id);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(job);
+  }
+  return result;
+}
+
+function artifactDisplayName(item: Record<string, string>) {
+  const label = ARTIFACT_LABELS[item.kind] || item.kind;
+  const parts = String(item.path || '').split(/[\\/]+/).filter(Boolean);
+  const name = parts[parts.length - 1] || item.path;
+  return `${label} · ${name}`;
 }
 
 function videoStatusMessage(video: Record<string, string>) {
@@ -235,6 +285,25 @@ function formatBytes(value: number) {
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function formatDurationEstimate(seconds: number) {
+  if (seconds < 60) return `约 ${Math.max(1, Math.round(seconds))} 秒`;
+  return `约 ${(seconds / 60).toFixed(seconds < 600 ? 1 : 0)} 分钟`;
+}
+
+function defaultFrameInterval(durationMinutes: number) {
+  return durationMinutes <= 10 ? 1 : 5;
+}
+
+function frameEstimate(durationMinutes: number, customIntervalEnabled: boolean, customIntervalSeconds: number) {
+  const intervalSeconds = customIntervalEnabled ? customIntervalSeconds : defaultFrameInterval(durationMinutes);
+  const durationSeconds = durationMinutes * 60;
+  const frameCount = Math.ceil(durationSeconds / Math.max(1, intervalSeconds));
+  const storageBytes = frameCount * ESTIMATED_FRAME_BYTES;
+  const modelFrameCount = Math.min(frameCount, MODEL_MAX_FRAMES_PER_DIMENSION) * MODEL_DIMENSION_COUNT;
+  const modelTimeSeconds = MODEL_DIMENSION_COUNT * 55 + modelFrameCount * 1.2;
+  return { intervalSeconds, frameCount, storageBytes, modelFrameCount, modelTimeSeconds };
 }
 
 function displayJobName(outputDir: string) {
@@ -286,12 +355,17 @@ export function App() {
   const [deletingProfileId, setDeletingProfileId] = useState<string | null>(null);
   const [cleanupSelection, setCleanupSelection] = useState<Record<CleanupCategory, boolean>>(emptyCleanupSelection);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+  const streamRef = useRef<EventSource | null>(null);
+  const selectedJobIdRef = useRef<string | null>(null);
+  const detailRequestSeqRef = useRef(0);
   const [jobForm, setJobForm] = useState({
     input_type: 'batch',
     inputs: '',
     output_dir: '',
     model_profile_id: '',
     max_videos: 50,
+    frame_interval_seconds: CUSTOM_FRAME_INTERVAL_DEFAULT_SECONDS,
+    frame_interval_custom: false,
   });
   const [message, setMessage] = useState('');
 
@@ -299,6 +373,7 @@ export function App() {
   const selectedCleanupCategories = CLEANUP_OPTIONS.filter((item) => cleanupSelection[item.key]).map((item) => item.key);
   const runningJobs = jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
   const latestJob = jobs[0];
+  const taskListJobs = useMemo(() => latestJobsByOutputDir(jobs), [jobs]);
 
   async function loadAll() {
     const [presetData, profileData, jobData] = await Promise.all([
@@ -319,6 +394,12 @@ export function App() {
 
   useEffect(() => {
     loadAll().catch((error) => setMessage(error.message));
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -408,6 +489,7 @@ export function App() {
         output_dir: jobForm.output_dir || null,
         model_profile_id: jobForm.model_profile_id,
         max_videos: Number(jobForm.max_videos),
+        frame_interval_seconds: jobForm.frame_interval_custom ? Number(jobForm.frame_interval_seconds) : null,
       }),
     });
     setActiveJob(job);
@@ -416,26 +498,49 @@ export function App() {
     await loadAll();
   }
 
-  async function refreshJob(id: string) {
+  async function refreshJob(id: string, seq = detailRequestSeqRef.current) {
     const detail = await api<Job>(`/api/jobs/${id}`);
+    if (selectedJobIdRef.current !== id || detailRequestSeqRef.current !== seq) return;
     setActiveJob(detail);
     await loadAll();
   }
 
+  function selectJob(id: string) {
+    detailRequestSeqRef.current += 1;
+    selectedJobIdRef.current = id;
+    streamRef.current?.close();
+    streamRef.current = null;
+    setLogs([]);
+    refreshJob(id).catch(console.error);
+  }
+
   function watchJob(id: string) {
+    detailRequestSeqRef.current += 1;
+    const seq = detailRequestSeqRef.current;
+    selectedJobIdRef.current = id;
+    streamRef.current?.close();
     setLogs([]);
     const stream = new EventSource(`${API}/api/jobs/${id}/events`);
+    streamRef.current = stream;
     stream.onmessage = (event) => {
+      if (selectedJobIdRef.current !== id || detailRequestSeqRef.current !== seq) {
+        stream.close();
+        return;
+      }
       const line = JSON.parse(event.data);
       if (line.message === '[stream-end]') {
         stream.close();
-        refreshJob(id).catch(console.error);
+        if (streamRef.current === stream) streamRef.current = null;
+        refreshJob(id, seq).catch(console.error);
         return;
       }
       setLogs((prev) => [...prev.slice(-250), line]);
-      refreshJob(id).catch(console.error);
+      refreshJob(id, seq).catch(console.error);
     };
-    stream.onerror = () => stream.close();
+    stream.onerror = () => {
+      stream.close();
+      if (streamRef.current === stream) streamRef.current = null;
+    };
   }
 
   async function cancelJob(id: string) {
@@ -676,11 +781,10 @@ export function App() {
                     <strong title={latestJob.output_dir}>{displayJobName(latestJob.output_dir)}</strong>
                     <small>{latestJob.created_at}</small>
                     <button
-                      onClick={() => {
-                        refreshJob(latestJob.id).catch(console.error);
-                        watchJob(latestJob.id);
-                        setTab('jobs');
-                      }}
+                    onClick={() => {
+                      selectJob(latestJob.id);
+                      setTab('jobs');
+                    }}
                     >
                       <Activity size={16} /> 查看任务
                     </button>
@@ -863,6 +967,71 @@ export function App() {
                 <input type="number" value={jobForm.max_videos} onChange={(e) => setJobForm({ ...jobForm, max_videos: Number(e.target.value) })} />
               </label>
             </div>
+            <div className="frame-settings-panel">
+              <div className="frame-settings-head">
+                <div>
+                  <h3>帧图抽取密度</h3>
+                  <p>默认配置会按视频时长自动抽帧：10 分钟内每 1 秒 1 帧，超过 10 分钟每 5 秒 1 帧。拖动滑动条后才启用自定义间隔。</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setJobForm({
+                      ...jobForm,
+                      frame_interval_seconds: CUSTOM_FRAME_INTERVAL_DEFAULT_SECONDS,
+                      frame_interval_custom: false,
+                    })
+                  }
+                >
+                  默认配置
+                </button>
+              </div>
+              <label className="range-label">
+                <span>
+                  当前：
+                  <strong>
+                    {jobForm.frame_interval_custom
+                      ? `自定义，每 ${jobForm.frame_interval_seconds} 秒 1 帧`
+                      : '默认配置：10 分钟内 1 秒/帧，10 分钟外 5 秒/帧'}
+                  </strong>
+                </span>
+                <input
+                  className={jobForm.frame_interval_custom ? 'active' : 'inactive'}
+                  type="range"
+                  min="1"
+                  max="30"
+                  step="1"
+                  value={jobForm.frame_interval_seconds}
+                  onPointerDown={() => setJobForm({ ...jobForm, frame_interval_custom: true })}
+                  onKeyDown={() => setJobForm({ ...jobForm, frame_interval_custom: true })}
+                  onChange={(event) =>
+                    setJobForm({
+                      ...jobForm,
+                      frame_interval_seconds: Number(event.target.value),
+                      frame_interval_custom: true,
+                    })
+                  }
+                />
+              </label>
+              <div className="frame-estimates">
+                {FRAME_ESTIMATE_DURATIONS.map((minutes) => {
+                  const estimate = frameEstimate(minutes, jobForm.frame_interval_custom, jobForm.frame_interval_seconds);
+                  return (
+                    <div className="frame-estimate-card" key={minutes}>
+                      <strong>{minutes} 分钟视频</strong>
+                      <small>{estimate.intervalSeconds} 秒/帧</small>
+                      <span>{estimate.frameCount.toLocaleString('zh-CN')} 帧</span>
+                      <small>{formatBytes(estimate.storageBytes)} 预估容量</small>
+                      <small>模型图 {estimate.modelFrameCount} 张</small>
+                      <small>炼化 {formatDurationEstimate(estimate.modelTimeSeconds)}</small>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="frame-estimate-note">
+                时间是这些帧经过筛选后参与 5 维大模型炼化的粗略预估，不是 ffmpeg 抽帧耗时。实际耗时会受模型速度、网络和图片复杂度影响。
+              </p>
+            </div>
             <button className="primary" disabled={!jobForm.model_profile_id} onClick={createJob}>
               <Play size={18} /> 启动固定流程
             </button>
@@ -931,15 +1100,12 @@ export function App() {
             <aside className="panel job-list-panel">
               <h2>任务列表</h2>
               <div className="list">
-                {jobs.map((job) => (
+                {taskListJobs.map((job) => (
                   <button
                     className={`job-row ${activeJob?.id === job.id ? 'active' : ''}`}
                     key={job.id}
                     title={job.output_dir}
-                    onClick={() => {
-                      refreshJob(job.id).catch(console.error);
-                      watchJob(job.id);
-                    }}
+                    onClick={() => selectJob(job.id)}
                   >
                     <span className="job-name">{displayJobName(job.output_dir)}</span>
                   </button>
@@ -1010,7 +1176,7 @@ export function App() {
                         <div className="artifacts">
                           {visibleArtifacts(activeJob).map((item) => (
                             <a href={`${API}/api/files?path=${encodeURIComponent(item.path)}`} target="_blank" key={item.id}>
-                              <FileText size={16} /> {item.kind} · {item.path}
+                              <FileText size={16} /> {artifactDisplayName(item)}
                             </a>
                           ))}
                         </div>

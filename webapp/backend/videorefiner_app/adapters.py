@@ -179,8 +179,11 @@ def _parse_douyin_blogger(url: str, limit: int, log: LogFn) -> list[dict[str, An
     if not match:
         raise RuntimeError("无法从抖音主页 URL 提取 sec_uid。")
     sec_uid = match.group(1)
+    opencli_limit = min(limit, 20)
+    if limit > opencli_limit:
+        log("warn", f"OpenCLI 抖音主页解析单次最多返回 20 个视频，本次请求 {limit} 个，将先解析最多 {opencli_limit} 个。")
     result = run_command(
-        ["opencli", "douyin", "user-videos", sec_uid, "--limit", str(min(limit, 50)), "--format", "json"],
+        ["opencli", "douyin", "user-videos", sec_uid, "--limit", str(opencli_limit), "--format", "json"],
         timeout=90,
     )
     if result.returncode != 0:
@@ -204,6 +207,97 @@ def _parse_douyin_blogger(url: str, limit: int, log: LogFn) -> list[dict[str, An
             }
         )
     log("info", f"OpenCLI 解析抖音主页得到 {len(rows)} 个视频")
+    if len(rows) < limit:
+        rows = _merge_video_rows(rows, _parse_douyin_blogger_by_browser_scroll(url, limit, {str(row["video_id"]) for row in rows}, log))
+    if len(rows) < limit:
+        raise RuntimeError(
+            f"请求解析 {limit} 个抖音视频，但当前固定解析阶梯只拿到 {len(rows)} 个。"
+            "请确认 Chrome 已登录该账号可见更多作品，或改用批量视频链接补足。"
+        )
+    return rows[:limit]
+
+
+def _merge_video_rows(base: list[dict[str, Any]], extra: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = {str(row.get("video_id")) for row in base}
+    rows = list(base)
+    for row in extra:
+        video_id = str(row.get("video_id") or "")
+        if not video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+        rows.append(row)
+    return rows
+
+
+def _parse_douyin_blogger_by_browser_scroll(url: str, limit: int, seen_ids: set[str], log: LogFn) -> list[dict[str, Any]]:
+    if not shutil.which("opencli"):
+        return []
+    session = "vr_parse_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+    log("info", f"OpenCLI 列表不足，启动浏览器滚动采集补足到 {limit} 个视频")
+    opened = run_command(["opencli", "browser", session, "open", url], timeout=45)
+    if opened.returncode != 0:
+        log("warn", f"浏览器滚动采集无法打开主页：{(opened.stderr or opened.stdout).strip()[-300:]}")
+        return []
+    run_command(["opencli", "browser", session, "wait", "time", "3"], timeout=10)
+
+    rows: list[dict[str, Any]] = []
+    max_rounds = max(12, min(45, limit * 2))
+    no_growth_rounds = 0
+    last_total = 0
+    collect_js = r"""
+    (() => {
+      const rows = [];
+      const seen = new Set();
+      const push = (href, title) => {
+        const text = String(href || '');
+        const match = text.match(/(?:\/video\/|modal_id=)(\d{15,})/);
+        if (!match || seen.has(match[1])) return;
+        seen.add(match[1]);
+        rows.push({
+          video_id: match[1],
+          url: `https://www.douyin.com/video/${match[1]}`,
+          title: String(title || '').replace(/\s+/g, ' ').trim()
+        });
+      };
+      document.querySelectorAll('a[href]').forEach((item) => {
+        push(item.href, item.innerText || item.getAttribute('aria-label') || item.title || '');
+      });
+      performance.getEntriesByType('resource').forEach((entry) => push(entry.name, ''));
+      return rows;
+    })()
+    """
+    for _ in range(max_rounds):
+        result = run_command(["opencli", "browser", session, "eval", collect_js], timeout=20)
+        if result.returncode == 0:
+            try:
+                for item in _parse_opencli_json_list(result.stdout):
+                    video_id = str(item.get("video_id") or "")
+                    if not video_id or video_id in seen_ids:
+                        continue
+                    seen_ids.add(video_id)
+                    rows.append(
+                        {
+                            "url": normalize_video_url(video_id),
+                            "video_id": video_id,
+                            "platform": "douyin",
+                            "title": item.get("title") or "",
+                        }
+                    )
+            except Exception as exc:
+                log("warn", f"浏览器滚动采集结果解析失败：{exc}")
+        total = len(seen_ids)
+        if total >= limit:
+            break
+        if total == last_total:
+            no_growth_rounds += 1
+        else:
+            no_growth_rounds = 0
+            last_total = total
+        if no_growth_rounds >= 5:
+            break
+        run_command(["opencli", "browser", session, "eval", "window.scrollTo(0, document.body.scrollHeight); document.body.scrollHeight"], timeout=10)
+        run_command(["opencli", "browser", session, "wait", "time", "1.2"], timeout=10)
+    log("info", f"浏览器滚动采集补充 {len(rows)} 个视频")
     return rows
 
 
@@ -346,7 +440,7 @@ def _download_douyin_from_blogger_play_url(
             errors.append(f"{blogger_url}: 无法提取 sec_uid")
             continue
         sec_uid = match.group(1)
-        limit = min(max(max_videos, 20), 50)
+        limit = 20
         result = run_command(
             ["opencli", "douyin", "user-videos", sec_uid, "--limit", str(limit), "--format", "json"],
             timeout=120,
@@ -550,11 +644,13 @@ def _curl_download(url: str, output_path: Path) -> None:
     raise RuntimeError((result.stderr or result.stdout or "curl 下载失败").strip()[-1000:])
 
 
-def extract_frames(config: AppConfig, video_path: Path, frames_dir: Path) -> list[Path]:
+def extract_frames(config: AppConfig, video_path: Path, frames_dir: Path, frame_interval_seconds: int | None = None) -> list[Path]:
     frames_dir.mkdir(parents=True, exist_ok=True)
     frame_pattern = frames_dir / "frame_%04d.jpg"
+    interval = max(1, int(frame_interval_seconds or 1))
+    fps_expr = f"fps=1/{interval}" if interval > 1 else f"fps={config.frame_fps}"
     result = run_command(
-        [config.ffmpeg_bin, "-y", "-i", str(video_path), "-vf", f"fps={config.frame_fps}", "-q:v", "2", str(frame_pattern)],
+        [config.ffmpeg_bin, "-y", "-i", str(video_path), "-vf", fps_expr, "-q:v", "2", str(frame_pattern)],
         timeout=300,
     )
     frames = sorted(frames_dir.glob("*.jpg"))

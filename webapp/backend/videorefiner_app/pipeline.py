@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import shutil
 import threading
 import time
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +15,17 @@ from typing import Any
 
 from . import __version__
 from .adapters import detect_platform, download_video, extract_frames, extract_video_id, parse_inputs
+from .benchmark import (
+    BENCHMARK_PROMPT,
+    build_benchmark_prompt,
+    build_fallback_benchmark_data,
+    collect_video_materials,
+    infer_creator,
+    infer_platform,
+    normalize_benchmark_data,
+    parse_benchmark_json,
+    write_benchmark_outputs,
+)
 from .config import AppConfig
 from .db import Database
 from .llm import LLMClient
@@ -84,7 +97,7 @@ class PipelineRunner:
 
     def run(self) -> None:
         self.db.update_job(self.job_id, status="running", started_at=utc_now(), error=None, cancel_requested=0)
-        self._log("info", "固定流程启动：预检 → 解析输入 → 下载 → 抽帧 → 文案 → 资料检查 → 5维蒸馏 → 合并")
+        self._log("info", "固定流程启动：预检 → 解析输入 → 下载 → 抽帧 → 文案 → 资料检查 → 5维蒸馏 → 合并 → Benchmark Intelligence")
         for directory in [self.output_dir, self.tmp_dir, self.single_dir, self.transcript_dir, self.keep_dir]:
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -102,6 +115,7 @@ class PipelineRunner:
             if failed_rows:
                 self._log("warn", f"{len(failed_rows)} 个视频达到自动重试上限或不可重试，将基于已完成视频先生成阶段性结果。")
             self._merge_outputs(completed_video_rows)
+            self._write_benchmark_intelligence(completed_video_rows)
         else:
             self._log("warn", "没有资料完整的视频，跳过合并精炼。")
             raise RuntimeError("所有视频都未处理成功，请查看视频失败原因。")
@@ -122,18 +136,27 @@ class PipelineRunner:
 
     def _load_or_parse_videos(self) -> list[dict[str, Any]]:
         existing = self.db.query_all("SELECT * FROM videos WHERE job_id = ? ORDER BY created_at ASC", [self.job_id])
-        if existing:
+        max_videos = int(self.job["max_videos"])
+        if existing and len(existing) >= max_videos:
             return existing
+        if existing:
+            self._log("warn", f"当前任务已有 {len(existing)}/{max_videos} 个视频，将重新解析主页并补充缺失视频")
         inputs = self.config_snapshot["inputs"]
-        parsed = parse_inputs(self.job["input_type"], inputs, int(self.job["max_videos"]), self._log)
+        parsed = parse_inputs(self.job["input_type"], inputs, max_videos, self._log)
+        existing_video_ids = {str(row["video_id"]) for row in existing}
         rows: list[dict[str, Any]] = []
         for item in parsed:
+            if str(item["video_id"]) in existing_video_ids:
+                continue
             video_db_id = self.db.create_video(self.job_id, item["video_id"], item["url"], item["platform"])
             for dim in DIMENSIONS:
                 self.db.add_dimension(self.job_id, video_db_id, dim["name"])
             row = self.db.query_one("SELECT * FROM videos WHERE id = ?", [video_db_id])
             if row:
                 rows.append(row)
+        if existing:
+            self._log("info", f"补充解析新增 {len(rows)} 个视频，当前共 {len(existing) + len(rows)} 个")
+            return self._get_video_rows()
         self._log("info", f"解析输入得到 {len(rows)} 个视频")
         return rows
 
@@ -206,6 +229,9 @@ class PipelineRunner:
                 "服务重启",
                 "中断",
                 "mcporter",
+                "whisper",
+                "文案",
+                "无任何文案来源",
             ]
         )
 
@@ -251,11 +277,23 @@ class PipelineRunner:
             self.db.add_artifact(self.job_id, "video", str(video_path), video_db_id, download)
 
             self.db.update_video(video_db_id, status="framing")
+            frame_interval_seconds, frame_interval_mode = self._frame_interval_config(video_path)
             frames = sorted(frames_dir.glob("*.jpg"))
+            if frames and not self._frames_match_task_config(frames_dir, frame_interval_seconds):
+                self._log("warn", f"{video_id} 现有帧图间隔与当前任务不一致，将重新抽帧")
+                shutil.rmtree(frames_dir)
+                frames = []
             if not frames:
-                self._log("info", f"抽帧：{video_id}")
-                frames = extract_frames(self.config, video_path, frames_dir)
-            self.db.add_artifact(self.job_id, "frames", str(frames_dir), video_db_id, {"count": len(frames)})
+                self._log("info", f"抽帧：{video_id}（{frame_interval_mode}，每 {frame_interval_seconds} 秒 1 帧）")
+                frames = extract_frames(self.config, video_path, frames_dir, frame_interval_seconds)
+                self._write_frames_meta(frames_dir, frame_interval_seconds, frame_interval_mode, len(frames))
+            self.db.add_artifact(
+                self.job_id,
+                "frames",
+                str(frames_dir),
+                video_db_id,
+                {"count": len(frames), "frame_interval_seconds": frame_interval_seconds, "frame_interval_mode": frame_interval_mode},
+            )
 
             self.db.update_video(video_db_id, status="transcribing")
             transcript = self._load_or_extract_transcript(video_id, video_path, frames_dir, raw_transcript_path, transcript_path, row)
@@ -296,6 +334,49 @@ class PipelineRunner:
         row = self.db.query_one("SELECT retry_count FROM videos WHERE id = ?", [video_db_id])
         return int((row or {}).get("retry_count") or 0) + 1
 
+    def _frame_interval_config(self, video_path: Path) -> tuple[int, str]:
+        value = self.config_snapshot.get("frame_interval_seconds")
+        if value is not None:
+            return max(1, int(value)), "自定义配置"
+        duration = self._video_duration_seconds(video_path)
+        if duration is not None and duration > 600:
+            return 5, "默认配置：10 分钟外视频"
+        return 1, "默认配置：10 分钟内视频"
+
+    def _video_duration_seconds(self, video_path: Path) -> float | None:
+        ffmpeg_path = Path(self.config.ffmpeg_bin)
+        ffprobe_bin = str(ffmpeg_path.with_name("ffprobe")) if ffmpeg_path.name == "ffmpeg" else "ffprobe"
+        result = run_command(
+            [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_path)],
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            duration = float(json.loads(result.stdout or "{}").get("format", {}).get("duration") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return duration if duration > 0 else None
+
+    def _frames_match_task_config(self, frames_dir: Path, frame_interval_seconds: int) -> bool:
+        meta_path = frames_dir / "frames_meta.json"
+        if not meta_path.exists():
+            return frame_interval_seconds == 1
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return False
+        return int(meta.get("frame_interval_seconds") or 1) == frame_interval_seconds
+
+    def _write_frames_meta(self, frames_dir: Path, frame_interval_seconds: int, frame_interval_mode: str, frame_count: int) -> None:
+        meta = {
+            "frame_interval_seconds": frame_interval_seconds,
+            "frame_interval_mode": frame_interval_mode,
+            "frame_count": frame_count,
+            "created_at": utc_now(),
+        }
+        (frames_dir / "frames_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def _load_or_extract_transcript(
         self,
         video_id: str,
@@ -309,7 +390,10 @@ class PipelineRunner:
             text = transcript_path.read_text(encoding="utf-8")
             if "提取方式：字幕/OCR" not in text:
                 marker = "## 完整文案"
-                return text.split(marker, 1)[-1].strip() if marker in text else text.strip()
+                transcript = text.split(marker, 1)[-1].strip() if marker in text else text.strip()
+                if not self._is_low_quality_transcript(transcript):
+                    return transcript
+                self._log("warn", f"{video_id} 检测到低质量旧文案，将重新提取或使用标题描述兜底")
             self._log("warn", f"{video_id} 检测到旧版整图 OCR 文案，将按新版 Whisper 主轨重新提取")
         worker_path = Path(__file__).resolve().parent / "media_worker.py"
         result = run_command(
@@ -329,10 +413,15 @@ class PipelineRunner:
             ],
             timeout=3600,
         )
+        meta: dict[str, Any]
         if result.returncode != 0:
-            raise RuntimeError((result.stderr or result.stdout or "文案提取失败").strip()[-1000:])
-        transcript = raw_output.read_text(encoding="utf-8").strip()
-        meta = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {}
+            worker_error = (result.stderr or result.stdout or "文案提取失败").strip()
+            raise RuntimeError(worker_error[-1000:])
+        else:
+            transcript = raw_output.read_text(encoding="utf-8").strip()
+            meta = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {}
+            if self._is_low_quality_transcript(transcript) and meta.get("source") not in {"底部硬字幕OCR兜底", "底部硬字幕OCR主文案"}:
+                raise RuntimeError("文案质量过低，未进入 5 维炼化")
         md = (
             f"# 视频文案 - {video_id}\n\n"
             f"> 标题：{row.get('title') or video_id}\n"
@@ -346,6 +435,20 @@ class PipelineRunner:
         self.db.add_artifact(self.job_id, "transcript", str(transcript_path), row["id"], meta)
         self._log("info", f"文案完成：{video_id}，{len(transcript)} 字")
         return transcript
+
+    def _is_low_quality_transcript(self, text: str) -> bool:
+        compact = re.sub(r"\s+", "", text or "")
+        if not compact:
+            return True
+        if "�" in compact:
+            return True
+        if len(compact) >= 20:
+            counts = Counter(compact)
+            most_common_ratio = counts.most_common(1)[0][1] / len(compact)
+            unique_ratio = len(counts) / len(compact)
+            if most_common_ratio > 0.45 or unique_ratio < 0.03:
+                return True
+        return bool(re.search(r"(.{1,3})\1{8,}", compact))
 
     def _distill_video(
         self,
@@ -440,6 +543,67 @@ class PipelineRunner:
             final_path.write_text(merged, encoding="utf-8")
             self.db.add_artifact(self.job_id, "final_output", str(final_path), None, {"dimension": dim["name"], "video_count": usable_count})
 
+    def _write_benchmark_intelligence(self, video_rows: list[dict[str, Any]]) -> None:
+        prompt_path = self.config.prompts_dir / BENCHMARK_PROMPT
+        prompt_template = prompt_path.read_text(encoding="utf-8")
+        creator = infer_creator(self.output_dir, self.config_snapshot)
+        platform = infer_platform(video_rows)
+        materials = collect_video_materials(
+            video_rows,
+            self.single_dir,
+            self.transcript_dir,
+            self.tmp_dir,
+            self.keep_dir,
+            DIMENSIONS,
+            min(self.config.max_merge_chars_per_video, 2000),
+        )
+        if not materials:
+            self._log("warn", "没有可用于 Benchmark Intelligence 的完成视频，跳过新版结构化产物。")
+            return
+
+        self._log("info", "生成 Benchmark Intelligence 结构化产物")
+        legacy_outputs = self._legacy_output_paths()
+        prompt = build_benchmark_prompt(
+            prompt_template,
+            creator,
+            platform,
+            materials,
+            legacy_outputs,
+            max(self.config.max_merge_chars_per_video, 4000),
+        )
+        try:
+            raw = self.llm.chat_text(
+                self.profile["merge_model"],
+                prompt,
+                max_tokens=max(8192, int(self.profile.get("max_tokens") or 8192)),
+                reasoning=bool(self.profile.get("supports_reasoning")),
+            )
+        except Exception as exc:
+            if self.profile.get("supports_reasoning"):
+                self._log("warn", f"reasoning Benchmark 汇总失败，关闭 reasoning 重试：{exc}")
+                raw = self.llm.chat_text(
+                    self.profile["merge_model"],
+                    prompt,
+                    max_tokens=max(8192, int(self.profile.get("max_tokens") or 8192)),
+                    reasoning=False,
+                )
+            else:
+                raise
+
+        try:
+            parsed = parse_benchmark_json(raw)
+            data = normalize_benchmark_data(parsed, creator, platform, materials)
+        except Exception as exc:
+            self._log("warn", f"Benchmark Intelligence JSON 解析失败，使用规则兜底结构：{exc}")
+            data = build_fallback_benchmark_data(creator, platform, materials)
+
+        for artifact in write_benchmark_outputs(self.output_dir, creator, platform, data, materials, legacy_outputs):
+            self.db.add_artifact(self.job_id, artifact["kind"], str(artifact["path"]), None, artifact.get("meta"))
+        self._log("info", "Benchmark Intelligence 结构化产物已生成")
+
+    def _legacy_output_paths(self) -> dict[str, Path]:
+        return {dim["name"]: self.output_dir / dim["output"] for dim in DIMENSIONS}
+
     def _select_frames(self, frames: list[Path]) -> list[Path]:
         if len(frames) <= self.config.max_dimension_frames:
             return frames
@@ -485,6 +649,9 @@ class PipelineRunner:
         for dim in DIMENSIONS:
             prompt_path = self.config.prompts_dir / dim["prompt"]
             prompt_hashes[dim["prompt"]] = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
+        benchmark_prompt_path = self.config.prompts_dir / BENCHMARK_PROMPT
+        if benchmark_prompt_path.exists():
+            prompt_hashes[BENCHMARK_PROMPT] = hashlib.sha256(benchmark_prompt_path.read_bytes()).hexdigest()
         artifacts = self.db.query_all("SELECT kind, path, meta_json FROM artifacts WHERE job_id = ? ORDER BY created_at ASC", [self.job_id])
         manifest = {
             "schema_version": 1,
@@ -492,7 +659,18 @@ class PipelineRunner:
             "job_id": self.job_id,
             "created_at": self.job["created_at"],
             "finished_at": utc_now(),
-            "state_machine": ["preflight", "parse", "download", "frames", "transcript", "material_check", "distill", "merge", "done"],
+            "state_machine": [
+                "preflight",
+                "parse",
+                "download",
+                "frames",
+                "transcript",
+                "material_check",
+                "distill",
+                "merge",
+                "benchmark_intelligence",
+                "done",
+            ],
             "model_profile": self.profile,
             "prompt_hashes": prompt_hashes,
             "config": self.config_snapshot,

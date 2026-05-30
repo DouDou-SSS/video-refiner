@@ -77,6 +77,7 @@ class JobCreateIn(BaseModel):
     model_profile_id: str
     output_dir: str | None = None
     max_videos: int = Field(default=50, ge=1, le=50)
+    frame_interval_seconds: int | None = Field(default=None, ge=1, le=60)
 
 
 class JobCleanupIn(BaseModel):

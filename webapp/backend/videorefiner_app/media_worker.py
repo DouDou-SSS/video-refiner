@@ -137,14 +137,18 @@ def _ocr_bottom_frames(frames_dir: Path, bottom_ratio: float = 0.35) -> tuple[st
 
     engine = RapidOCR()
     lines: list[str] = []
-    frame_count = 0
     used_count = 0
     ratio = min(max(bottom_ratio, 0.1), 0.6)
+    frames = sorted(frames_dir.glob("*.jpg"))
+    total_frames = len(frames)
+    max_frames = int(os.environ.get("VIDEO_REFINER_OCR_MAX_FRAMES", "240"))
+    if max_frames > 0 and total_frames > max_frames:
+        step = (total_frames - 1) / max(max_frames - 1, 1)
+        frames = [frames[round(index * step)] for index in range(max_frames)]
 
     with tempfile.TemporaryDirectory(prefix="video-refiner-ocr-") as tmp:
         tmp_dir = Path(tmp)
-        for frame_path in sorted(frames_dir.glob("*.jpg")):
-            frame_count += 1
+        for frame_path in frames:
             crop_path = tmp_dir / frame_path.name
             with Image.open(frame_path) as image:
                 width, height = image.size
@@ -160,13 +164,14 @@ def _ocr_bottom_frames(frames_dir: Path, bottom_ratio: float = 0.35) -> tuple[st
     deduped = _dedupe_lines(lines)
     return " ".join(deduped).strip(), {
         "ocr_region": f"bottom_{ratio:.2f}",
-        "ocr_frames": frame_count,
+        "ocr_frames": total_frames,
+        "ocr_frames_sampled": len(frames),
         "ocr_frames_with_text": used_count,
         "ocr_lines": len(deduped),
     }
 
 
-def _ocr_hotwords(ocr_text: str, limit: int = 900) -> str:
+def _ocr_hotwords(ocr_text: str, limit: int = 300) -> str:
     cleaned = re.sub(r"[@#][\w\u4e00-\u9fff-]+", " ", ocr_text)
     cleaned = re.sub(r"[^\w\u4e00-\u9fff，。！？；：、 ]+", " ", cleaned)
     chunks = re.split(r"[，。！？；：、\s]+", cleaned)
@@ -189,9 +194,22 @@ def _ocr_hotwords(ocr_text: str, limit: int = 900) -> str:
     return text[:limit]
 
 
-def _whisper(video_path: Path, ocr_reference: str) -> tuple[str, str]:
+def _ocr_is_primary_source(ocr_text: str, ocr_meta: dict[str, Any]) -> bool:
+    min_chars = int(os.environ.get("VIDEO_REFINER_OCR_PRIMARY_MIN_CHARS", "1200"))
+    min_text_frames = int(os.environ.get("VIDEO_REFINER_OCR_PRIMARY_MIN_TEXT_FRAMES", "12"))
+    min_text_frame_ratio = float(os.environ.get("VIDEO_REFINER_OCR_PRIMARY_MIN_FRAME_RATIO", "0.12"))
+    sampled = int(ocr_meta.get("ocr_frames_sampled") or 0)
+    frames_with_text = int(ocr_meta.get("ocr_frames_with_text") or 0)
+    frame_ratio = frames_with_text / max(sampled, 1)
+    return len(ocr_text.strip()) >= min_chars and frames_with_text >= min_text_frames and frame_ratio >= min_text_frame_ratio
+
+
+def _whisper(video_path: Path, ocr_reference: str, ffmpeg_bin: str, segments_dir: Path) -> tuple[str, str, dict[str, Any]]:
     from faster_whisper import WhisperModel
 
+    duration_seconds = _media_duration(video_path, ffmpeg_bin)
+    long_video_seconds = int(os.environ.get("VIDEO_REFINER_LONG_VIDEO_SECONDS", "600"))
+    segment_seconds = int(os.environ.get("VIDEO_REFINER_WHISPER_SEGMENT_SECONDS", "300"))
     bundled_model = Path(os.environ.get("VIDEO_REFINER_WHISPER_MODEL_PATH", str(BUNDLED_WHISPER_MODEL))).expanduser()
     if bundled_model.exists():
         requested_model = str(bundled_model)
@@ -217,26 +235,184 @@ def _whisper(video_path: Path, ocr_reference: str) -> tuple[str, str]:
                 cpu_threads=int(os.environ.get("VIDEO_REFINER_WHISPER_CPU_THREADS", "0")),
                 local_files_only=os.environ.get("VIDEO_REFINER_WHISPER_LOCAL_ONLY", "0") == "1",
             )
-            segments, _ = model.transcribe(
-                str(video_path),
-                language="zh",
-                beam_size=int(os.environ.get("VIDEO_REFINER_WHISPER_BEAM_SIZE", "8")),
-                best_of=int(os.environ.get("VIDEO_REFINER_WHISPER_BEST_OF", "8")),
-                patience=float(os.environ.get("VIDEO_REFINER_WHISPER_PATIENCE", "1.2")),
-                temperature=[0.0, 0.2, 0.4],
-                condition_on_previous_text=True,
-                vad_filter=False,
-                no_speech_threshold=0.35,
-                compression_ratio_threshold=2.4,
-                log_prob_threshold=-1.0,
-                initial_prompt=prompt or None,
-                hotwords=hotwords or None,
-            )
             model_label = Path(model_size).name if Path(model_size).exists() else model_size
-            return " ".join(segment.text for segment in segments).strip(), model_label
+            if duration_seconds and duration_seconds > long_video_seconds:
+                text, count = _transcribe_segmented(
+                    model,
+                    video_path,
+                    ffmpeg_bin,
+                    segments_dir,
+                    duration_seconds,
+                    max(60, segment_seconds),
+                    prompt,
+                    hotwords,
+                )
+                return text, f"{model_label}-segmented", {
+                    "whisper_long_video": True,
+                    "whisper_duration_seconds": round(duration_seconds, 2),
+                    "whisper_segment_seconds": max(60, segment_seconds),
+                    "whisper_segments": count,
+                    "whisper_segments_dir": str(segments_dir),
+                }
+            text, whisper_mode = _transcribe_with_fallback(model, video_path, prompt, hotwords)
+            audio_fallback = False
+            if not text.strip():
+                with tempfile.TemporaryDirectory(prefix="video-refiner-whisper-audio-") as tmp:
+                    audio_path = Path(tmp) / f"{video_path.stem}.wav"
+                    _extract_audio(video_path, audio_path, ffmpeg_bin, duration_seconds)
+                    text, whisper_mode = _transcribe_with_fallback(model, audio_path, prompt, hotwords)
+                    audio_fallback = True
+            return text, model_label, {
+                "whisper_long_video": False,
+                "whisper_duration_seconds": round(duration_seconds, 2) if duration_seconds else None,
+                "whisper_audio_fallback": audio_fallback,
+                "whisper_decode_mode": whisper_mode,
+            }
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"Whisper 转写失败：{last_error}")
+
+
+def _extract_audio(video_path: Path, audio_path: Path, ffmpeg_bin: str, duration_seconds: float | None) -> None:
+    result = subprocess.run(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(audio_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=max(180, int((duration_seconds or 60) * 2)),
+    )
+    if result.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size <= 1024:
+        raise RuntimeError((result.stderr or result.stdout or "Whisper 音频兜底提取失败").strip()[-1000:])
+
+
+def _transcribe_with_fallback(model: Any, media_path: Path, prompt: str, hotwords: str) -> tuple[str, str]:
+    try:
+        return _transcribe_with_whisper(model, media_path, prompt, hotwords, "high"), "high"
+    except Exception as exc:
+        high_error = exc
+    try:
+        return _transcribe_with_whisper(model, media_path, "", "", "simple"), "simple"
+    except Exception as simple_exc:
+        raise RuntimeError(f"高精度参数失败：{high_error}; 简单参数失败：{simple_exc}") from simple_exc
+
+
+def _transcribe_with_whisper(model: Any, video_path: Path, prompt: str, hotwords: str, mode: str) -> str:
+    if mode == "simple":
+        kwargs = {
+            "language": "zh",
+            "beam_size": int(os.environ.get("VIDEO_REFINER_WHISPER_SIMPLE_BEAM_SIZE", "5")),
+        }
+    else:
+        kwargs = {
+            "language": "zh",
+            "beam_size": int(os.environ.get("VIDEO_REFINER_WHISPER_BEAM_SIZE", "8")),
+            "best_of": int(os.environ.get("VIDEO_REFINER_WHISPER_BEST_OF", "8")),
+            "patience": float(os.environ.get("VIDEO_REFINER_WHISPER_PATIENCE", "1.2")),
+            "temperature": [0.0, 0.2, 0.4],
+            "condition_on_previous_text": True,
+            "vad_filter": False,
+            "no_speech_threshold": 0.35,
+            "compression_ratio_threshold": 2.4,
+            "log_prob_threshold": -1.0,
+            "initial_prompt": prompt or None,
+            "hotwords": hotwords or None,
+        }
+    segments, _ = model.transcribe(str(video_path), **kwargs)
+    return " ".join(segment.text for segment in segments).strip()
+
+
+def _transcribe_segmented(
+    model: Any,
+    video_path: Path,
+    ffmpeg_bin: str,
+    segments_dir: Path,
+    duration_seconds: float,
+    segment_seconds: int,
+    prompt: str,
+    hotwords: str,
+) -> tuple[str, int]:
+    segments_dir.mkdir(parents=True, exist_ok=True)
+    segment_count = int((duration_seconds + segment_seconds - 1) // segment_seconds)
+    parts: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="video-refiner-whisper-segments-") as tmp:
+        tmp_dir = Path(tmp)
+        for index in range(segment_count):
+            start = index * segment_seconds
+            length = min(segment_seconds, max(1, duration_seconds - start))
+            text_path = segments_dir / f"segment_{index:03d}.txt"
+            if text_path.exists():
+                segment_text = text_path.read_text(encoding="utf-8").strip()
+            else:
+                audio_path = tmp_dir / f"segment_{index:03d}.wav"
+                result = subprocess.run(
+                    [
+                        ffmpeg_bin,
+                        "-y",
+                        "-ss",
+                        str(start),
+                        "-t",
+                        str(length),
+                        "-i",
+                        str(video_path),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-c:a",
+                        "pcm_s16le",
+                        str(audio_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=max(180, int(length * 2)),
+                )
+                if result.returncode != 0 or not audio_path.exists():
+                    raise RuntimeError((result.stderr or result.stdout or f"分段音频提取失败：{index}").strip()[-1000:])
+                segment_text, _ = _transcribe_with_fallback(model, audio_path, prompt, hotwords)
+                text_path.write_text(segment_text, encoding="utf-8")
+            parts.append(f"[{_format_stamp(start)}-{_format_stamp(start + length)}]\n{segment_text}")
+    return "\n\n".join(parts).strip(), segment_count
+
+
+def _media_duration(video_path: Path, ffmpeg_bin: str) -> float | None:
+    ffprobe_bin = _paired_tool(ffmpeg_bin, "ffprobe")
+    try:
+        result = subprocess.run(
+            [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return float(json.loads(result.stdout or "{}").get("format", {}).get("duration") or 0)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _format_stamp(seconds: float) -> str:
+    value = max(0, int(seconds))
+    hours, remainder = divmod(value, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _punctuate(text: str) -> str:
@@ -256,6 +432,21 @@ def _punctuate(text: str) -> str:
         return result.get("text", text)
     except Exception:
         return text
+
+
+def _is_low_quality_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact:
+        return True
+    if "�" in compact:
+        return True
+    if len(compact) >= 20:
+        counts = Counter(compact)
+        most_common_ratio = counts.most_common(1)[0][1] / len(compact)
+        unique_ratio = len(counts) / len(compact)
+        if most_common_ratio > 0.45 or unique_ratio < 0.03:
+            return True
+    return bool(re.search(r"(.{1,3})\1{8,}", compact))
 
 
 def _write_sidecar(output: Path, suffix: str, text: str) -> str:
@@ -295,19 +486,43 @@ def main() -> None:
         if ocr_text:
             meta["ocr_reference_chars"] = len(ocr_text)
             meta["ocr_reference_path"] = _write_sidecar(output, "ocr_reference", ocr_text)
-
-        raw_text, model_size = _whisper(video_path, ocr_text)
-        source = "Whisper高精度"
-        if ocr_text:
-            source += "+底部硬字幕OCR校对"
-        meta["whisper_model"] = model_size
-        meta["whisper_raw_chars"] = len(raw_text)
-        meta["whisper_raw_path"] = _write_sidecar(output, "whisper_raw", raw_text)
+        if ocr_text and _ocr_is_primary_source(ocr_text, meta):
+            raw_text = ocr_text
+            source = "底部硬字幕OCR主文案"
+            meta["ocr_primary_source"] = True
+        else:
+            segments_dir = output.parent / f"{args.video_id}_segments"
+            try:
+                raw_text, model_size, whisper_meta = _whisper(video_path, ocr_text, args.ffmpeg_bin, segments_dir)
+                source = "Whisper高精度"
+                if ocr_text:
+                    source += "+底部硬字幕OCR校对"
+                meta["whisper_model"] = model_size
+                meta.update(whisper_meta)
+                meta["whisper_raw_chars"] = len(raw_text)
+                meta["whisper_raw_path"] = _write_sidecar(output, "whisper_raw", raw_text)
+                if ocr_text and _is_low_quality_text(raw_text):
+                    raw_text = ocr_text
+                    source = "底部硬字幕OCR兜底"
+                    meta["whisper_low_quality_fallback"] = True
+                    meta["fallback_reason"] = "Whisper returned low quality text; using bottom OCR text"
+            except Exception as exc:
+                if not ocr_text:
+                    raise
+                raw_text = ocr_text
+                source = "底部硬字幕OCR兜底"
+                meta["whisper_error"] = str(exc)[-500:]
+                meta["fallback_reason"] = "Whisper failed; using bottom OCR text"
 
     if not raw_text.strip():
         raise SystemExit("无任何文案来源")
 
-    corrected = _punctuate(raw_text)
+    if _is_low_quality_text(raw_text):
+        corrected = raw_text
+        meta["low_quality_transcript"] = True
+        meta["low_quality_reason"] = "repeated_or_garbled_text"
+    else:
+        corrected = _punctuate(raw_text)
     output.write_text(corrected, encoding="utf-8")
     meta.update({"source": source, "chars": len(corrected)})
     print(json.dumps(meta, ensure_ascii=False))

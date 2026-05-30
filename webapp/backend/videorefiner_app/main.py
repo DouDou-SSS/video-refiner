@@ -76,6 +76,15 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def no_cache_frontend(request, call_next):
+    response = await call_next(request)
+    if not request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 def _profile_out(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -221,7 +230,7 @@ def create_job(payload: JobCreateIn) -> dict[str, Any]:
         output_dir,
         payload.model_profile_id,
         profile_out,
-        config_snapshot(config, payload.inputs, job_meta),
+        config_snapshot(config, payload.inputs, {**job_meta, "frame_interval_seconds": payload.frame_interval_seconds}),
         min(payload.max_videos, config.daily_limit),
     )
     db.add_log(job["id"], "info", "任务已创建")

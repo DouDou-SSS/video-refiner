@@ -494,6 +494,95 @@ textarea {
   width: auto;
 }
 
+.frame-settings-panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 14px 0 16px;
+  display: grid;
+  gap: 14px;
+  background: var(--surface-soft);
+}
+
+.frame-settings-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.frame-settings-head h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.frame-settings-head p,
+.frame-estimate-note {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.range-label {
+  margin: 0;
+}
+
+.range-label span {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.range-label input {
+  padding: 0;
+  accent-color: var(--primary);
+}
+
+.range-label input.inactive {
+  accent-color: #98a2b3;
+  opacity: 0.62;
+}
+
+.range-label input.active {
+  opacity: 1;
+}
+
+.frame-estimates {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.frame-estimate-card {
+  min-height: 148px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  background: var(--surface);
+}
+
+.frame-estimate-card strong,
+.frame-estimate-card span,
+.frame-estimate-card small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame-estimate-card span {
+  color: var(--primary);
+  font-size: 20px;
+  font-weight: 800;
+}
+
+.frame-estimate-card small {
+  color: var(--muted);
+}
+
 .checks {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -923,6 +1012,7 @@ textarea {
   .dashboard-grid,
   .jobs-layout,
   .dashboard-lower-grid,
+  .frame-estimates,
   .grid.two {
     grid-template-columns: 1fr;
   }

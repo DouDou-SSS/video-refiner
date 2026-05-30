@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT_DIR/dist_portable"
 PACKAGE_DIR="$BUILD_DIR/video-refiner"
 ZIP_PATH="$BUILD_DIR/video-refiner-portable.zip"
+CAMOUFOX_CACHE_SRC="${VIDEO_REFINER_CAMOUFOX_CACHE:-$HOME/Library/Caches/camoufox}"
 export COPYFILE_DISABLE=1
 
 log() {
@@ -31,6 +32,7 @@ require_file "$ROOT_DIR/models/whisper/faster-whisper-tiny/tokenizer.json"
 require_file "$ROOT_DIR/prompts"
 require_file "$ROOT_DIR/webapp/backend/videorefiner_app"
 require_file "$ROOT_DIR/webapp/backend/requirements.txt"
+require_file "$CAMOUFOX_CACHE_SRC/Camoufox.app"
 
 if [[ ! -f "$ROOT_DIR/webapp/frontend/dist/index.html" ]]; then
   if [[ ! -f "$ROOT_DIR/webapp/frontend/package.json" ]]; then
@@ -48,6 +50,7 @@ fi
 log "创建干净分发目录"
 rm -rf "$BUILD_DIR"
 mkdir -p "$PACKAGE_DIR/webapp/backend" "$PACKAGE_DIR/webapp/frontend" "$PACKAGE_DIR/models/whisper"
+mkdir -p "$PACKAGE_DIR/vendor/camoufox"
 
 rsync -a "$ROOT_DIR/install.command" "$PACKAGE_DIR/"
 rsync -a "$ROOT_DIR/start.command" "$PACKAGE_DIR/"
@@ -67,6 +70,10 @@ rsync -a \
   --exclude ".DS_Store" \
   "$ROOT_DIR/webapp/backend/videorefiner_app" "$PACKAGE_DIR/webapp/backend/"
 rsync -a "$ROOT_DIR/webapp/frontend/dist" "$PACKAGE_DIR/webapp/frontend/"
+rsync -a "$CAMOUFOX_CACHE_SRC/Camoufox.app" "$PACKAGE_DIR/vendor/camoufox/"
+if [[ -f "$CAMOUFOX_CACHE_SRC/version.json" ]]; then
+  rsync -a "$CAMOUFOX_CACHE_SRC/version.json" "$PACKAGE_DIR/vendor/camoufox/"
+fi
 
 chmod +x "$PACKAGE_DIR/install.command" "$PACKAGE_DIR/start.command"
 

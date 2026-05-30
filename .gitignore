@@ -56,6 +56,9 @@ camoufox/
 .gitnexus/
 .claude/
 
+# CodeGraph local index
+.codegraph/
+
 # GitNexus auto-generated (should not be committed)
 AGENTS.md
 CLAUDE.md
