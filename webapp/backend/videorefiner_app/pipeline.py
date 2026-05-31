@@ -31,16 +31,28 @@ from .db import Database
 from .llm import LLMClient
 from .security import SecretStore
 from .utils import local_timestamp, run_command, utc_now
-from .validation import validate_model_profile_for_5d
+from .validation import validate_model_profile_for_refinement
 
 
-DIMENSIONS = [
+SINGLE_VIDEO_DIMENSIONS = [
     {"name": "文案风格", "prompt": "文案风格蒸馏.md", "output": "文案风格.md"},
     {"name": "视频脚本", "prompt": "视频脚本蒸馏.md", "output": "视频脚本.md"},
     {"name": "剪辑逻辑", "prompt": "剪辑逻辑蒸馏.md", "output": "剪辑逻辑.md"},
     {"name": "选题策略", "prompt": "选题策略蒸馏.md", "output": "选题策略.md"},
     {"name": "运营策略", "prompt": "运营策略蒸馏.md", "output": "运营策略.md"},
 ]
+BENCHMARK_DIMENSION = {
+    "name": "Benchmark Intelligence",
+    "prompt": BENCHMARK_PROMPT,
+    "outputs": [
+        "creator_profile.md",
+        "pattern_library.md",
+        "qa_checklist.md",
+        "retrieval_index.json",
+        "retrieval_pack.md",
+    ],
+}
+DIMENSIONS = SINGLE_VIDEO_DIMENSIONS
 
 
 class JobCancelled(RuntimeError):
@@ -97,7 +109,7 @@ class PipelineRunner:
 
     def run(self) -> None:
         self.db.update_job(self.job_id, status="running", started_at=utc_now(), error=None, cancel_requested=0)
-        self._log("info", "固定流程启动：预检 → 解析输入 → 下载 → 抽帧 → 文案 → 资料检查 → 5维蒸馏 → 合并 → Benchmark Intelligence")
+        self._log("info", "固定流程启动：预检 → 解析输入 → 下载 → 抽帧 → 文案 → 资料检查 → 5个单视频维度蒸馏 → 跨视频合并 → 第6维 Benchmark Intelligence 汇总")
         for directory in [self.output_dir, self.tmp_dir, self.single_dir, self.transcript_dir, self.keep_dir]:
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -130,7 +142,7 @@ class PipelineRunner:
             self._log("info", "任务完成")
 
     def _check_model_capability(self) -> None:
-        validation_errors = validate_model_profile_for_5d(self.profile)
+        validation_errors = validate_model_profile_for_refinement(self.profile)
         if validation_errors:
             raise RuntimeError("；".join(validation_errors))
 
@@ -421,7 +433,7 @@ class PipelineRunner:
             transcript = raw_output.read_text(encoding="utf-8").strip()
             meta = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else {}
             if self._is_low_quality_transcript(transcript) and meta.get("source") not in {"底部硬字幕OCR兜底", "底部硬字幕OCR主文案"}:
-                raise RuntimeError("文案质量过低，未进入 5 维炼化")
+                raise RuntimeError("文案质量过低，未进入 6 维炼化")
         md = (
             f"# 视频文案 - {video_id}\n\n"
             f"> 标题：{row.get('title') or video_id}\n"
@@ -561,6 +573,7 @@ class PipelineRunner:
             self._log("warn", "没有可用于 Benchmark Intelligence 的完成视频，跳过新版结构化产物。")
             return
 
+        self._log("info", "蒸馏维度：Benchmark Intelligence 汇总")
         self._log("info", "生成 Benchmark Intelligence 结构化产物")
         legacy_outputs = self._legacy_output_paths()
         prompt = build_benchmark_prompt(
@@ -671,6 +684,10 @@ class PipelineRunner:
                 "benchmark_intelligence",
                 "done",
             ],
+            "pipeline_dimensions": {
+                "single_video": SINGLE_VIDEO_DIMENSIONS,
+                "creator_level": BENCHMARK_DIMENSION,
+            },
             "model_profile": self.profile,
             "prompt_hashes": prompt_hashes,
             "config": self.config_snapshot,

@@ -137,7 +137,7 @@ def build_benchmark_prompt(
         [
             prompt_template,
             f"# 输入上下文\n- creator: {creator}\n- platform: {platform}\n- video_count: {len(materials)}",
-            "# 旧版 5 维合并结果",
+            "# 旧版 5 个单视频维度合并结果",
             "\n\n".join(legacy_text) or "无",
             "# 单视频资料摘录",
             "\n\n---\n\n".join(video_text),

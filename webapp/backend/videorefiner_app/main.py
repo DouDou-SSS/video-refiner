@@ -24,7 +24,7 @@ from .providers import PROVIDER_PRESETS
 from .schemas import JobCleanupIn, JobCreateIn, ModelProfileIn
 from .security import SecretStore
 from .utils import local_timestamp, utc_now
-from .validation import validate_model_profile_for_5d
+from .validation import validate_model_profile_for_refinement
 
 
 config = load_config()
@@ -221,7 +221,7 @@ def create_job(payload: JobCreateIn) -> dict[str, Any]:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="模型配置不存在") from exc
     profile_out = _profile_out(profile)
-    validation_errors = validate_model_profile_for_5d(profile_out)
+    validation_errors = validate_model_profile_for_refinement(profile_out)
     if validation_errors:
         raise HTTPException(status_code=400, detail="；".join(validation_errors))
     output_dir, job_meta = _resolve_output_dir(payload)

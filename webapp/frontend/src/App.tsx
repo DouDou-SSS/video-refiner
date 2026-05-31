@@ -83,10 +83,10 @@ const CLEANUP_OPTIONS: Array<{ key: CleanupCategory; label: string; description:
 const PIPELINE_STEPS = [
   ['01', '环境预检', '确认 ffmpeg、Whisper、OCR、下载组件和模型配置可用。'],
   ['02', '解析与下载', '解析单视频、批量链接或博主主页，按阶梯方案下载视频。'],
-  ['03', '抽帧与文案', '按默认策略或自定义间隔抽帧；文案优先软字幕，其次 Whisper，OCR 只做校对辅助。'],
+  ['03', '抽帧与文案', '按默认策略或自定义间隔抽帧；软字幕优先，底部硬字幕足够时 OCR 可作为主文案，Whisper 失败会降级重试。'],
   ['04', '资料检查', '跳过资料不完整的视频，失败进入明确状态并支持自动重试。'],
-  ['05', '5 维炼化', '单视频蒸馏后跨视频合并，产出 5 份兼容旧结构的文档。'],
-  ['06', '结构化知识库', '生成 creator profile、pattern library、QA checklist、video cards 和 retrieval pack。'],
+  ['05', '5 个单视频维度', '单视频蒸馏后跨视频合并，产出 5 份兼容旧结构的文档。'],
+  ['06', 'Benchmark Intelligence', '生成 creator profile、pattern library、QA checklist、video cards 和 retrieval pack。'],
 ];
 
 const VISIBLE_ARTIFACT_KINDS = [
@@ -102,7 +102,7 @@ const VISIBLE_ARTIFACT_KINDS = [
 ];
 
 const ARTIFACT_LABELS: Record<string, string> = {
-  final_output: '旧版 5 维文档',
+  final_output: '旧版 5 个单视频维度文档',
   benchmark_profile: 'Creator Profile',
   benchmark_pattern_library: 'Pattern Library',
   benchmark_qa_checklist: 'QA Checklist',
@@ -662,7 +662,7 @@ export function App() {
               <div>
                 <span className="eyebrow">Fixed Pipeline</span>
                 <h2>把视频炼化固定成可重复的软件流程</h2>
-                <p>LLM 只参与单视频 5 维蒸馏和跨视频合并精炼，流程判断、下载、抽帧、转写、重试全部由本机程序按状态机执行。</p>
+                <p>LLM 只参与 5 个单视频维度蒸馏、跨视频合并精炼和 Benchmark Intelligence 汇总，流程判断、下载、抽帧、转写、重试全部由本机程序按状态机执行。</p>
               </div>
               <div className="hero-actions">
                 <button className="primary" onClick={() => setTab('run')}>
@@ -706,7 +706,7 @@ export function App() {
                 <div className="panel-heading">
                   <div>
                     <span className="eyebrow">主流程</span>
-                    <h2>5 维炼化状态机</h2>
+                    <h2>6 维炼化状态机</h2>
                   </div>
                   <span className="pill ok">固定执行</span>
                 </div>
@@ -749,7 +749,7 @@ export function App() {
                     <Boxes size={18} />
                     <span>
                       <strong>文案策略</strong>
-                      <small>软字幕优先，Whisper 为主，OCR 只辅助校对</small>
+                      <small>软字幕优先；底部硬字幕足够时 OCR 可作主文案；Whisper 失败自动降级</small>
                     </span>
                   </div>
                   <div>
@@ -1029,7 +1029,7 @@ export function App() {
                 })}
               </div>
               <p className="frame-estimate-note">
-                时间是这些帧经过筛选后参与 5 维大模型炼化的粗略预估，不是 ffmpeg 抽帧耗时。实际耗时会受模型速度、网络和图片复杂度影响。
+                时间是这些帧经过筛选后参与 5 个单视频图文维度炼化的粗略预估，不包含 Benchmark Intelligence 汇总，不是 ffmpeg 抽帧耗时。实际耗时会受模型速度、网络和图片复杂度影响。
               </p>
             </div>
             <button className="primary" disabled={!jobForm.model_profile_id} onClick={createJob}>
@@ -1061,7 +1061,7 @@ export function App() {
                   <div className="cleanup-panel">
                     <div className="cleanup-head">
                       <strong>清理产物</strong>
-                      <small>只清理勾选类别，最终 5 份文档、manifest 和进度文件会保留</small>
+                      <small>只清理勾选类别，最终文档、Benchmark 产物、manifest 和进度文件会保留</small>
                     </div>
                     <div className="cleanup-options">
                       {CLEANUP_OPTIONS.map((item) => {

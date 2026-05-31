@@ -140,7 +140,7 @@ def test_model_profile(profile: dict[str, Any], api_key: str) -> dict[str, Any]:
         except Exception as exc:
             errors.append(f"图片输入失败：{exc}")
     elif not profile.get("supports_vision"):
-        errors.append("该配置声明不支持图片输入，不能运行 5 维炼化。")
+        errors.append("该配置声明不支持图片输入，不能运行 6 维炼化中的单视频帧图分析。")
 
     if text_ok and bool(profile.get("supports_reasoning")):
         try:
@@ -158,7 +158,7 @@ def test_model_profile(profile: dict[str, Any], api_key: str) -> dict[str, Any]:
         "vision_ok": vision_ok,
         "reasoning_ok": reasoning_ok,
         "long_context_risk": _long_context_risk(profile),
-        "message": "模型配置可用于 5 维炼化" if ok else "模型配置未通过必需能力检测",
+        "message": "模型配置可用于 6 维炼化" if ok else "模型配置未通过必需能力检测",
         "errors": errors,
     }
 

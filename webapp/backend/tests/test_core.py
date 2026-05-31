@@ -19,7 +19,7 @@ from videorefiner_app.pipeline import PipelineRunner
 from videorefiner_app.providers import PROVIDER_PRESETS
 from videorefiner_app.schemas import JobCreateIn
 from videorefiner_app.security import SecretStore
-from videorefiner_app.validation import validate_model_profile_for_5d
+from videorefiner_app.validation import validate_model_profile_for_refinement
 
 
 def test_provider_presets_cover_required_options() -> None:
@@ -40,8 +40,8 @@ def test_safe_path_name_keeps_blogger_name_readable() -> None:
     assert safe_path_name("   ") == "未命名博主"
 
 
-def test_text_only_profile_is_blocked_for_5d() -> None:
-    errors = validate_model_profile_for_5d(
+def test_text_only_profile_is_blocked_for_refinement() -> None:
+    errors = validate_model_profile_for_refinement(
         {
             "is_tested": True,
             "supports_vision": False,
