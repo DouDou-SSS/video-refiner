@@ -6,6 +6,7 @@ import {
   ClipboardList,
   Cpu,
   Database,
+  Eye,
   FileText,
   FolderOpen,
   Gauge,
@@ -71,6 +72,67 @@ type Preflight = {
 type LogLine = { id: number; ts: string; level: string; message: string };
 type Tab = 'home' | 'models' | 'jobs' | 'run';
 type CleanupCategory = 'frames' | 'single_analysis' | 'kept_videos' | 'transcripts' | 'raw_data';
+type VideoAutomationExportResult = {
+  ok: boolean;
+  path: string;
+  manifest: {
+    productName: string;
+    creator: string;
+    platform: string;
+    videoCount: number;
+    generatedAt: string;
+    schemaVersion: string;
+  };
+  validation: {
+    status: 'passed';
+    validVideoCount: number;
+    failedVideoCount: number;
+  };
+  file_count: number;
+};
+
+type EvidenceObservation = {
+  visual_description?: string;
+  shot_type?: string;
+  composition?: string;
+  on_screen_text_observation?: string;
+  transition_observation?: string;
+  confidence?: string;
+  uncertainty?: string;
+};
+
+type EvidenceShot = {
+  evidence_id: string;
+  start_seconds: number;
+  end_seconds: number;
+  time_range: string;
+  keyframe: string;
+  keyframe_url?: string;
+  scene_score?: number;
+  segment_type?: 'evidence_window' | 'detected_cut_segment';
+  boundary_source?: 'uniform_coverage' | 'scene_peak' | 'detected_cut';
+  boundary_confidence?: 'high' | 'medium' | 'low';
+  transcript_excerpt?: string;
+  ocr_excerpt?: string;
+  text_alignment?: string;
+  visual_observation?: EvidenceObservation;
+};
+
+type EvidenceQuality = {
+  transcript_alignment?: 'timed' | 'coarse';
+  alignment_status?: 'timed' | 'coarse';
+  observation_coverage?: 'complete' | 'partial';
+  visual_confidence_summary?: { high?: number; medium?: number; low?: number };
+  eligible_for_precise_timing?: boolean;
+};
+
+type EvidenceTimeline = {
+  video_id: string;
+  duration_seconds: number;
+  quality?: EvidenceQuality;
+  scene_curve?: Array<{ timestamp_seconds: number; score: number }>;
+  shots: EvidenceShot[];
+};
 
 const CLEANUP_OPTIONS: Array<{ key: CleanupCategory; label: string; description: string }> = [
   { key: 'frames', label: '帧图片', description: '原始数据里的 *_frames 目录' },
@@ -80,13 +142,24 @@ const CLEANUP_OPTIONS: Array<{ key: CleanupCategory; label: string; description:
   { key: 'raw_data', label: '原始数据', description: '下载视频和转写中间文件' },
 ];
 
+function evidenceSegmentLabel(type?: string) {
+  return type === 'detected_cut_segment' ? '检测切段' : '证据窗口';
+}
+
+function evidenceBoundaryLabel(source?: string) {
+  if (source === 'detected_cut') return '场景检测切点';
+  if (source === 'scene_peak') return '场景峰值采样';
+  return '均匀采样';
+}
+
 const PIPELINE_STEPS = [
   ['01', '环境预检', '确认 ffmpeg、Whisper、OCR、下载组件和模型配置可用。'],
   ['02', '解析与下载', '解析单视频、批量链接或博主主页，按阶梯方案下载视频。'],
   ['03', '抽帧与文案', '按默认策略或自定义间隔抽帧；软字幕优先，底部硬字幕足够时 OCR 可作为主文案，Whisper 失败会降级重试。'],
-  ['04', '资料检查', '跳过资料不完整的视频，失败进入明确状态并支持自动重试。'],
-  ['05', '5 个单视频维度', '单视频蒸馏后跨视频合并，产出 5 份兼容旧结构的文档。'],
-  ['06', 'Benchmark Intelligence', '生成 creator profile、pattern library、QA checklist、video cards 和 retrieval pack。'],
+  ['04', '证据时间线', '场景变化、关键帧、图文时间关联和视觉证据只生成一次，供后续步骤复用。'],
+  ['05', '资料检查', '跳过资料不完整的视频，失败进入明确状态并支持自动重试。'],
+  ['06', '5 个单视频维度', '每项关键判断都引用证据时间线，随后产出 5 份兼容旧结构的文档。'],
+  ['07', 'Benchmark Intelligence', '生成 creator profile、pattern library、QA checklist、video cards 和 retrieval pack。'],
 ];
 
 const VISIBLE_ARTIFACT_KINDS = [
@@ -97,6 +170,7 @@ const VISIBLE_ARTIFACT_KINDS = [
   'retrieval_index',
   'retrieval_pack',
   'raw_refs',
+  'visual_timeline',
   'manifest',
   'progress',
 ];
@@ -109,6 +183,7 @@ const ARTIFACT_LABELS: Record<string, string> = {
   retrieval_index: 'Retrieval Index',
   retrieval_pack: 'Retrieval Pack',
   raw_refs: 'Raw 引用',
+  visual_timeline: '视觉证据时间线',
   manifest: 'Manifest',
   progress: '进度',
 };
@@ -163,7 +238,7 @@ const emptyProfile = (preset?: Preset) => ({
   temperature: preset?.temperature ?? 0.2,
 });
 
-function computeJobProgress(job: Job) {
+function computeJobProgress(job: Job, logs: LogLine[] = []) {
   const videos = job.videos || [];
   const dimensions = job.dimensions || [];
   const isActive = ['queued', 'running'].includes(job.status);
@@ -175,6 +250,7 @@ function computeJobProgress(job: Job) {
     downloading: 0.12,
     framing: 0.24,
     transcribing: 0.38,
+    evidencing: 0.47,
     distilling: 0.48,
     retry_wait: 0.05,
     done: 1,
@@ -207,16 +283,55 @@ function computeJobProgress(job: Job) {
   const failedCount = videos.filter((video) => video.status === 'failed').length;
   const retryWaitCount = videos.filter((video) => video.status === 'retry_wait').length;
   const skippedCount = videos.filter((video) => video.status === 'skipped').length;
-  const percent = totalVideos ? Math.max(0, Math.min(100, Math.round((progressSum / totalUnits) * 100))) : 0;
-  const currentLabel = currentVideo
+  const videoPercent = totalVideos ? Math.max(0, Math.min(100, Math.round((progressSum / totalUnits) * 100))) : 0;
+  let percent = job.status === 'running' ? Math.round(videoPercent * 0.8) : videoPercent;
+  let currentLabel = currentVideo
     ? `${currentVideo.video_id || '当前视频'} · ${currentDimension?.dimension || currentStep}`
     : job.status === 'running'
-      ? '合并精炼或收尾中'
+      ? '跨视频合并精炼中'
       : job.status === 'partial_done'
         ? '已生成阶段性结果，可重试失败视频'
       : job.status === 'failed'
         ? '任务已停止，可点击重试继续'
       : '无运行中步骤';
+
+  if (job.status === 'running' && !currentVideo && totalVideos > 0) {
+    if (job.error) {
+      percent = Math.min(99, Math.max(percent, 98));
+      currentLabel = 'Benchmark Intelligence 等待云端模型自动重试';
+    }
+    const mergeDimensions = new Set(
+      logs
+        .map((line) => line.message.match(/^合并输出：(.+)$/)?.[1])
+        .filter((value): value is string => Boolean(value)),
+    );
+    const benchmarkLine = [...logs]
+      .reverse()
+      .map((line) => ({ line, match: line.message.match(/Benchmark 视频卡片批次 (\d+)\/(\d+)/) }))
+      .find((item) => item.match);
+
+    if (job.error) {
+      // 任务级错误已经在详情区单独展示，这里只保留阶段名，避免进度条文案过长。
+    } else if (benchmarkLine?.match) {
+      const batch = Number(benchmarkLine.match[1]);
+      const totalBatches = Number(benchmarkLine.match[2]);
+      const completedBatches = Math.max(0, Math.min(totalBatches, batch - 1));
+      percent = Math.min(98, 90 + Math.round((completedBatches / Math.max(1, totalBatches)) * 8));
+      currentLabel = batch >= totalBatches
+        ? `Benchmark Intelligence：第 ${batch}/${totalBatches} 批处理中，随后生成账号级汇总`
+        : `Benchmark Intelligence：第 ${batch}/${totalBatches} 批处理中`;
+    } else {
+      percent = Math.min(90, 80 + mergeDimensions.size * 2);
+      currentLabel = mergeDimensions.size
+        ? `跨视频合并精炼：${mergeDimensions.size}/5 个维度完成`
+        : '跨视频合并精炼中';
+    }
+  }
+
+  if (job.status === 'done') {
+    percent = 100;
+    currentLabel = '全部流程已完成，可以导出';
+  }
 
   return {
     percent,
@@ -329,6 +444,7 @@ function computeVideoProgress(video: Record<string, string>, dimensions: Array<R
     downloading: 12,
     framing: 24,
     transcribing: 38,
+    evidencing: 47,
     done: 100,
     skipped: 100,
     failed: jobIsActive ? 0 : 100,
@@ -355,6 +471,11 @@ export function App() {
   const [deletingProfileId, setDeletingProfileId] = useState<string | null>(null);
   const [cleanupSelection, setCleanupSelection] = useState<Record<CleanupCategory, boolean>>(emptyCleanupSelection);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [metadataRefreshBusy, setMetadataRefreshBusy] = useState(false);
+  const [videoAutomationExportPath, setVideoAutomationExportPath] = useState('');
+  const [evidenceTimeline, setEvidenceTimeline] = useState<EvidenceTimeline | null>(null);
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
   const streamRef = useRef<EventSource | null>(null);
   const selectedJobIdRef = useRef<string | null>(null);
   const detailRequestSeqRef = useRef(0);
@@ -373,6 +494,7 @@ export function App() {
   const selectedCleanupCategories = CLEANUP_OPTIONS.filter((item) => cleanupSelection[item.key]).map((item) => item.key);
   const runningJobs = jobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
   const latestJob = jobs[0];
+  const activeJobCanExport = Boolean(activeJob && ['done', 'partial_done'].includes(activeJob.status));
   const taskListJobs = useMemo(() => latestJobsByOutputDir(jobs), [jobs]);
 
   async function loadAll() {
@@ -511,6 +633,7 @@ export function App() {
     streamRef.current?.close();
     streamRef.current = null;
     setLogs([]);
+    setEvidenceTimeline(null);
     refreshJob(id).catch(console.error);
   }
 
@@ -574,6 +697,40 @@ export function App() {
     }
   }
 
+  async function exportForVideoAutomation(job: Job) {
+    setExportBusy(true);
+    setVideoAutomationExportPath('');
+    setMessage('正在导出给 VideoAutomation 使用的轻量包...');
+    try {
+      const result = await api<VideoAutomationExportResult>(`/api/jobs/${job.id}/export-videoautomation`, { method: 'POST' });
+      setVideoAutomationExportPath(result.path);
+      setMessage(`质量核验通过，已导出 ${result.validation.validVideoCount} 个视频的起号基底包：${result.path}`);
+      await refreshJob(job.id);
+    } catch (error) {
+      setMessage(`导出失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
+  async function refreshPlatformMetadata(job: Job) {
+    setMetadataRefreshBusy(true);
+    setMessage('正在从平台补抓发布时间和视频时长，不会重跑炼化...');
+    try {
+      const result = await api<{ updated: number; remaining: number; errors: string[] }>(
+        `/api/jobs/${job.id}/refresh-platform-metadata`,
+        { method: 'POST' },
+      );
+      const failed = result.errors.length ? `，${result.errors.length} 条读取失败` : '';
+      setMessage(`平台元数据补抓完成：更新 ${result.updated} 条，仍缺失 ${result.remaining} 条${failed}`);
+      await refreshJob(job.id);
+    } catch (error) {
+      setMessage(`平台元数据补抓失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setMetadataRefreshBusy(false);
+    }
+  }
+
   async function cleanupJobArtifacts(job: Job) {
     if (!selectedCleanupCategories.length) {
       setMessage('请先勾选要删除的产物类别');
@@ -596,6 +753,19 @@ export function App() {
       await refreshJob(job.id);
     } finally {
       setCleanupBusy(false);
+    }
+  }
+
+  async function loadEvidenceTimeline(job: Job, videoId: string) {
+    setEvidenceLoading(true);
+    setEvidenceTimeline(null);
+    try {
+      const timeline = await api<EvidenceTimeline>(`/api/jobs/${job.id}/evidence/${encodeURIComponent(videoId)}`);
+      if (selectedJobIdRef.current === job.id) setEvidenceTimeline(timeline);
+    } catch (error) {
+      setMessage(`读取证据时间线失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setEvidenceLoading(false);
     }
   }
 
@@ -1057,7 +1227,33 @@ export function App() {
                     <button onClick={() => openOutputDir(activeJob.id)}>
                       <FolderOpen size={16} /> 产物目录
                     </button>
+                    <button
+                      disabled={metadataRefreshBusy || ['queued', 'running'].includes(activeJob.status)}
+                      title="重新从平台读取缺失的发布时间和视频时长，不会重跑炼化"
+                      onClick={() => refreshPlatformMetadata(activeJob)}
+                    >
+                      <RefreshCcw size={16} /> {metadataRefreshBusy ? '补抓中' : '补抓发布时间'}
+                    </button>
+                    <button
+                      disabled={exportBusy || !activeJobCanExport}
+                      title={activeJobCanExport ? '导出给 VideoAutomation 使用' : '任务完成后才能导出'}
+                      onClick={() => exportForVideoAutomation(activeJob)}
+                    >
+                      <Boxes size={16} /> {exportBusy ? '导出中' : '导出给 VideoAutomation 使用'}
+                    </button>
                   </div>
+                  {videoAutomationExportPath && (
+                    <div className="export-result">
+                      <strong>VideoAutomation 导出路径</strong>
+                      <code>{videoAutomationExportPath}</code>
+                    </div>
+                  )}
+                  {activeJob.error && (
+                    <div className="task-warning">
+                      <strong>{['queued', 'running'].includes(activeJob.status) ? '等待云端模型自动重试' : '任务错误'}</strong>
+                      <span>{activeJob.error}</span>
+                    </div>
+                  )}
                   <div className="cleanup-panel">
                     <div className="cleanup-head">
                       <strong>清理产物</strong>
@@ -1117,7 +1313,7 @@ export function App() {
               {activeJob ? (
                 <>
                   {(() => {
-                    const progress = computeJobProgress(activeJob);
+                    const progress = computeJobProgress(activeJob, logs);
                     return (
                       <div className="progress-panel">
                         <div className="progress-head">
@@ -1164,10 +1360,84 @@ export function App() {
                             <span>完成进度 {videoProgress}%</span>
                             {message && <span title={message}>{message}</span>}
                           </div>
+                          {video.status === 'done' && (
+                            <button
+                              className="icon-button video-evidence-button"
+                              title="查看证据时间线"
+                              aria-label={`查看 ${video.video_id} 的证据时间线`}
+                              onClick={() => loadEvidenceTimeline(activeJob, String(video.video_id))}
+                            >
+                              <Eye size={16} />
+                            </button>
+                          )}
                         </div>
                       );
                     })}
                   </div>
+
+                  <section className="evidence-timeline" aria-live="polite">
+                    <div className="evidence-heading">
+                      <div>
+                        <h3>证据时间线</h3>
+                        <p>关键画面、对应文案与视觉结论均可回溯；证据窗口只是采样分析范围，不等于真实镜头或精确切点。</p>
+                      </div>
+                      {evidenceLoading && <span className="pill">加载中</span>}
+                    </div>
+                    {evidenceTimeline ? (
+                      <>
+                        <div className="evidence-summary">
+                          <span>视频 ID：{evidenceTimeline.video_id}</span>
+                          <span>时长：{Math.round(evidenceTimeline.duration_seconds || 0)} 秒</span>
+                          <span>时间线节点：{evidenceTimeline.shots.length}</span>
+                          <span>检测切段：{evidenceTimeline.shots.filter((shot) => shot.segment_type === 'detected_cut_segment').length}</span>
+                          <span>文案对齐：{String(evidenceTimeline.quality?.alignment_status || evidenceTimeline.quality?.transcript_alignment || 'unknown')}</span>
+                          <span>精确时序：{evidenceTimeline.quality?.eligible_for_precise_timing ? '可用' : '不适用'}</span>
+                        </div>
+                        {!!evidenceTimeline.scene_curve?.length && (
+                          <div className="scene-curve" title="本地 FFmpeg 计算的场景变化强度；柱越高代表画面变化越明显，不代表内容质量。">
+                            <span className="scene-curve-label">场景变化</span>
+                            <div className="scene-curve-bars" aria-label="场景变化曲线">
+                              {evidenceTimeline.scene_curve.map((point, index) => (
+                                <i
+                                  key={`${point.timestamp_seconds}-${index}`}
+                                  style={{ height: `${Math.max(4, Math.min(100, point.score * 100))}%` }}
+                                  title={`${Math.round(point.timestamp_seconds)} 秒 · 变化强度 ${point.score.toFixed(3)}`}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        <div className="evidence-shot-grid">
+                          {evidenceTimeline.shots.map((shot) => (
+                            <article className="evidence-shot" key={shot.evidence_id}>
+                              {shot.keyframe_url ? (
+                                <img src={`${API}${shot.keyframe_url}`} alt={`${shot.evidence_id} 关键帧`} loading="lazy" />
+                              ) : (
+                                <div className="evidence-image-empty">关键帧不可用</div>
+                              )}
+                              <div className="evidence-shot-meta">
+                                <span>{shot.time_range}</span>
+                                <span title={shot.evidence_id}>{shot.evidence_id}</span>
+                              </div>
+                              <p>{shot.visual_observation?.visual_description || '未生成视觉描述'}</p>
+                              {shot.transcript_excerpt && <small>文案：{shot.transcript_excerpt}</small>}
+                              {shot.ocr_excerpt && <small>屏幕文字：{shot.ocr_excerpt}</small>}
+                              <div className="evidence-shot-tags">
+                                <span>{evidenceSegmentLabel(shot.segment_type)}</span>
+                                <span>{evidenceBoundaryLabel(shot.boundary_source)}</span>
+                                <span>边界 {shot.boundary_confidence || 'low'}</span>
+                                <span>{shot.visual_observation?.shot_type || '未确认'}</span>
+                                <span>{shot.visual_observation?.confidence || 'low'}</span>
+                                <span>{shot.text_alignment || 'coarse'}</span>
+                              </div>
+                            </article>
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="empty">点击已完成视频卡片右下角的查看按钮，加载该视频的证据时间线。</div>
+                    )}
+                  </section>
 
                   <div className="dashboard-lower-grid">
                     <div className="side-stack">

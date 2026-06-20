@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig
-from .utils import run_command
+from .metadata import extract_duration_seconds, extract_published_at
+from .utils import list_visible_files, run_command
 
 
 LogFn = Callable[[str, str], None]
@@ -172,6 +173,40 @@ def parse_inputs(input_type: str, inputs: list[str], max_videos: int, log: LogFn
     return all_rows[:max_videos]
 
 
+def fetch_platform_metadata(url: str, platform: str, log: LogFn) -> dict[str, Any]:
+    """从视频平台重新读取公开元数据，不下载视频。"""
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError("未安装 yt-dlp，无法补抓平台元数据")
+    log("info", f"补抓平台元数据：{extract_video_id(url)}")
+    result = run_command(
+        [
+            "yt-dlp",
+            "--no-warnings",
+            "--skip-download",
+            "--cookies-from-browser",
+            "chrome",
+            "--dump-single-json",
+            url,
+        ],
+        timeout=90,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "平台元数据读取失败").strip()[-500:])
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"平台元数据不是有效 JSON：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("平台元数据不是对象")
+    return {
+        "platform": platform,
+        "title": payload.get("title") or "",
+        "published_at": extract_published_at(payload),
+        "duration": extract_duration_seconds(payload),
+        "metadata_source": "yt-dlp",
+    }
+
+
 def _parse_douyin_blogger(url: str, limit: int, log: LogFn) -> list[dict[str, Any]]:
     if not opencli_connected():
         raise RuntimeError("抖音博主主页解析需要 OpenCLI Chrome 扩展连接；直接视频链接不受影响。")
@@ -203,6 +238,8 @@ def _parse_douyin_blogger(url: str, limit: int, log: LogFn) -> list[dict[str, An
                 "video_id": video_id,
                 "platform": "douyin",
                 "title": item.get("title") or item.get("desc") or "",
+                "published_at": extract_published_at(item),
+                "duration": extract_duration_seconds(item),
                 "play_url": _first_url(item.get("play_url") or item.get("download_url") or ""),
             }
         )
@@ -281,6 +318,8 @@ def _parse_douyin_blogger_by_browser_scroll(url: str, limit: int, seen_ids: set[
                             "video_id": video_id,
                             "platform": "douyin",
                             "title": item.get("title") or "",
+                            "published_at": extract_published_at(item),
+                            "duration": extract_duration_seconds(item),
                         }
                     )
             except Exception as exc:
@@ -324,6 +363,8 @@ def _parse_bilibili_blogger(url: str, limit: int, log: LogFn) -> list[dict[str, 
                             "video_id": video_id,
                             "platform": "bilibili",
                             "title": item.get("title") or "",
+                            "published_at": extract_published_at(item),
+                            "duration": extract_duration_seconds(item),
                         }
                     )
             if rows:
@@ -351,11 +392,12 @@ def download_video(
     api_key: str | None = None,
     source_urls: list[str] | None = None,
     max_videos: int = 50,
+    source_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     platform = detect_platform(url)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if platform == "douyin":
-        return _download_douyin(url, output_path, log, api_key, source_urls or [], max_videos)
+        return _download_douyin(url, output_path, log, api_key, source_urls or [], max_videos, source_meta or {})
     if platform == "bilibili":
         return _download_bilibili(url, output_path, log)
     return _download_ytdlp(url, output_path, platform, log)
@@ -368,12 +410,14 @@ def _download_douyin(
     api_key: str | None = None,
     source_urls: list[str] | None = None,
     max_videos: int = 50,
+    source_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     errors: list[tuple[str, str]] = []
+    source_meta = source_meta or {}
 
     if shutil.which("mcporter"):
         try:
-            log("info", "抖音下载阶梯 1/4：MCP 解析直链")
+            log("info", "抖音下载阶梯 1/5：MCP 解析直链")
             env = os.environ.copy()
             if api_key:
                 env["DASHSCOPE_API_KEY"] = api_key
@@ -394,6 +438,8 @@ def _download_douyin(
                         "platform": "douyin",
                         "method": "mcporter",
                         "title": data.get("title") or "",
+                        "published_at": extract_published_at(data),
+                        "duration": extract_duration_seconds(data),
                         "size_mb": round(output_path.stat().st_size / 1024 / 1024, 2),
                     }
                 raise RuntimeError("MCP 未返回 download_url")
@@ -402,6 +448,23 @@ def _download_douyin(
             log("warn", f"MCP 下载失败，继续降级：{exc}")
     else:
         errors.append(("MCP 直链", "未安装 mcporter"))
+
+    cached_url = _first_url(source_meta.get("play_url") or source_meta.get("download_url"))
+    if cached_url:
+        try:
+            log("info", "抖音下载阶梯 2/5：复用主页解析直链")
+            _curl_download(cached_url, output_path)
+            return {
+                "platform": "douyin",
+                "method": "cached-play-url",
+                "title": source_meta.get("title") or source_meta.get("desc") or "",
+                "published_at": extract_published_at(source_meta),
+                "duration": extract_duration_seconds(source_meta),
+                "size_mb": round(output_path.stat().st_size / 1024 / 1024, 2),
+            }
+        except Exception as exc:
+            errors.append(("缓存直链", str(exc)))
+            log("warn", f"缓存直链下载失败，继续降级：{exc}")
 
     for name, downloader in [
         ("OpenCLI 博主列表直链", lambda: _download_douyin_from_blogger_play_url(url, output_path, source_urls or [], max_videos, log)),
@@ -425,7 +488,7 @@ def _download_douyin_from_blogger_play_url(
     max_videos: int,
     log: LogFn,
 ) -> dict[str, Any]:
-    log("info", "抖音下载阶梯 2/4：OpenCLI 博主列表直链")
+    log("info", "抖音下载阶梯 3/5：OpenCLI 博主列表直链")
     if not shutil.which("opencli"):
         raise RuntimeError("未安装 opencli")
     current_id = extract_video_id(url)
@@ -465,6 +528,8 @@ def _download_douyin_from_blogger_play_url(
                 "platform": "douyin",
                 "method": "opencli-user-videos-play-url",
                 "title": item.get("title") or item.get("desc") or "",
+                "published_at": extract_published_at(item),
+                "duration": extract_duration_seconds(item),
                 "size_mb": round(output_path.stat().st_size / 1024 / 1024, 2),
             }
         errors.append(f"{sec_uid}: 最近 {limit} 条未找到 {current_id}")
@@ -473,7 +538,7 @@ def _download_douyin_from_blogger_play_url(
 
 
 def _download_douyin_ytdlp(url: str, output_path: Path, log: LogFn) -> dict[str, Any]:
-    log("info", "抖音下载阶梯 3/4：yt-dlp + Chrome cookies")
+    log("info", "抖音下载阶梯 4/5：yt-dlp + Chrome cookies")
     if not shutil.which("yt-dlp"):
         raise RuntimeError("未安装 yt-dlp")
     if output_path.exists() and output_path.stat().st_size <= 1024:
@@ -504,7 +569,7 @@ def _download_douyin_ytdlp(url: str, output_path: Path, log: LogFn) -> dict[str,
 
 
 def _download_douyin_browser_video(url: str, output_path: Path, log: LogFn) -> dict[str, Any]:
-    log("info", "抖音下载阶梯 4/4：OpenCLI 浏览器视频源")
+    log("info", "抖音下载阶梯 5/5：OpenCLI 浏览器视频源")
     if not shutil.which("opencli"):
         raise RuntimeError("未安装 opencli")
     session = "vr_video_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
@@ -653,7 +718,7 @@ def extract_frames(config: AppConfig, video_path: Path, frames_dir: Path, frame_
         [config.ffmpeg_bin, "-y", "-i", str(video_path), "-vf", fps_expr, "-q:v", "2", str(frame_pattern)],
         timeout=300,
     )
-    frames = sorted(frames_dir.glob("*.jpg"))
+    frames = list_visible_files(frames_dir, "*.jpg")
     if result.returncode != 0 or not frames:
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg 抽帧失败").strip()[-1000:])
     return frames

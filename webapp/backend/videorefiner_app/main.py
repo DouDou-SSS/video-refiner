@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,10 +18,13 @@ from .adapters import resolve_blogger_name
 from .cleanup import artifact_kinds_for_cleanup, cleanup_outputs, estimate_cleanup_outputs
 from .config import REPO_ROOT, load_config
 from .db import Database
+from .evidence import read_visual_timeline, validate_visual_timeline
+from .export_package import export_videoautomation_package
 from .llm import parse_test_result, test_model_profile
+from .metadata_refresh import refresh_job_platform_metadata
 from .pipeline import TaskManager, config_snapshot
 from .preflight import run_preflight
-from .providers import PROVIDER_PRESETS
+from .providers import PROVIDER_PRESETS, VISION_CAPABLE_PROVIDER_KEYS
 from .schemas import JobCleanupIn, JobCreateIn, ModelProfileIn
 from .security import SecretStore
 from .utils import local_timestamp, utc_now
@@ -188,7 +192,7 @@ def test_profile(profile_id: str) -> dict[str, Any]:
     if not api_key:
         raise HTTPException(status_code=400, detail="模型配置没有 API Key")
     profile_for_test = _profile_out(profile)
-    if profile_for_test["provider_key"] in {"bailian", "openai", "openrouter", "custom"}:
+    if profile_for_test["provider_key"] in VISION_CAPABLE_PROVIDER_KEYS:
         profile_for_test["supports_vision"] = True
     result = test_model_profile(profile_for_test, api_key)
     db.set_model_test_result(profile_id, result)
@@ -262,6 +266,43 @@ def get_artifacts(job_id: str) -> list[dict[str, Any]]:
     return db.query_all("SELECT * FROM artifacts WHERE job_id = ? ORDER BY created_at ASC", [job_id])
 
 
+@app.get("/api/jobs/{job_id}/evidence/{video_id}")
+def get_video_evidence_timeline(job_id: str, video_id: str) -> dict[str, Any]:
+    try:
+        job = db.get_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    row = db.query_one("SELECT id FROM videos WHERE job_id = ? AND video_id = ?", [job_id, video_id])
+    if not row:
+        raise HTTPException(status_code=404, detail="视频不属于该任务")
+
+    output_dir = Path(job["output_dir"]).expanduser().resolve()
+    timeline_path = output_dir / "evidence" / f"{video_id}.visual_timeline.json"
+    if not timeline_path.is_file():
+        raise HTTPException(status_code=404, detail="该视频尚未生成证据时间线")
+    try:
+        timeline = read_visual_timeline(timeline_path)
+        validate_visual_timeline(timeline, require_visual_observations=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    for shot in timeline.get("shots", []):
+        if not isinstance(shot, dict):
+            continue
+        keyframe_ref = Path(str(shot.get("keyframe") or ""))
+        if keyframe_ref.is_absolute() or ".." in keyframe_ref.parts:
+            shot["keyframe_url"] = ""
+            continue
+        keyframe_path = (output_dir / keyframe_ref).resolve()
+        try:
+            keyframe_path.relative_to(output_dir)
+        except ValueError:
+            shot["keyframe_url"] = ""
+            continue
+        shot["keyframe_url"] = f"/api/files?path={quote(str(keyframe_path))}" if keyframe_path.is_file() else ""
+    return timeline
+
+
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str) -> dict[str, Any]:
     try:
@@ -304,6 +345,24 @@ def retry_job(job_id: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/jobs/{job_id}/refresh-platform-metadata")
+def refresh_platform_metadata(job_id: str) -> dict[str, Any]:
+    try:
+        job = db.get_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    if job["status"] in {"queued", "running"}:
+        raise HTTPException(status_code=400, detail="任务运行中，不能同时补抓平台元数据")
+
+    result = refresh_job_platform_metadata(
+        db,
+        job_id,
+        Path(job["output_dir"]),
+        lambda level, message: db.add_log(job_id, level, message),
+    )
+    return {"ok": True, **result}
+
+
 @app.post("/api/jobs/{job_id}/open-output-dir")
 def open_output_dir(job_id: str) -> dict[str, Any]:
     try:
@@ -320,6 +379,29 @@ def open_output_dir(job_id: str) -> dict[str, Any]:
     except subprocess.SubprocessError as exc:
         raise HTTPException(status_code=500, detail=f"打开目录失败：{exc}") from exc
     return {"ok": True, "path": str(output_dir)}
+
+
+@app.post("/api/jobs/{job_id}/export-videoautomation")
+def export_for_videoautomation(job_id: str) -> dict[str, Any]:
+    try:
+        job = db.get_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    if job["status"] in {"queued", "running"}:
+        raise HTTPException(status_code=400, detail="任务运行中，不能导出")
+    if job["status"] not in {"done", "partial_done"}:
+        raise HTTPException(status_code=400, detail="任务未完成，不能导出。请先点击重试，等 Benchmark Intelligence 生成完成后再导出。")
+
+    try:
+        result = export_videoautomation_package(
+            Path(job["output_dir"]),
+            (config.output_root,),
+            requested_video_count=int(job.get("max_videos") or 0) or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.add_log(job_id, "info", f"已导出 VideoAutomation 起号基底包：{result['path']}")
+    return result
 
 
 @app.post("/api/jobs/{job_id}/cleanup")

@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+from .metadata import extract_duration_seconds, extract_published_at
 from .utils import redact, utc_now
 
 
@@ -57,7 +58,9 @@ CREATE TABLE IF NOT EXISTS videos (
   title TEXT,
   author TEXT,
   duration REAL,
+  published_at TEXT,
   method TEXT,
+  source_meta_json TEXT,
   error TEXT,
   skip_reason TEXT,
   created_at TEXT NOT NULL,
@@ -130,6 +133,10 @@ class Database:
             self._conn.execute("ALTER TABLE videos ADD COLUMN last_error_at TEXT")
         if "next_retry_at" not in columns:
             self._conn.execute("ALTER TABLE videos ADD COLUMN next_retry_at TEXT")
+        if "source_meta_json" not in columns:
+            self._conn.execute("ALTER TABLE videos ADD COLUMN source_meta_json TEXT")
+        if "published_at" not in columns:
+            self._conn.execute("ALTER TABLE videos ADD COLUMN published_at TEXT")
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -292,15 +299,33 @@ class Database:
         values.append(job_id)
         self.execute(f"UPDATE jobs SET {', '.join(pairs)} WHERE id = ?", values)
 
-    def create_video(self, job_id: str, video_id: str, url: str, platform: str) -> str:
+    def create_video(self, job_id: str, video_id: str, url: str, platform: str, meta: dict[str, Any] | None = None) -> str:
         video_db_id = str(uuid.uuid4())
         now = utc_now()
+        source_meta = {key: value for key, value in (meta or {}).items() if key not in {"url", "video_id", "platform"}}
+        duration = extract_duration_seconds(source_meta)
+        published_at = extract_published_at(source_meta)
         self.execute(
             """
-            INSERT INTO videos (id, job_id, video_id, url, platform, status, retry_count, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            INSERT INTO videos (
+              id, job_id, video_id, url, platform, status, title, duration, published_at,
+              source_meta_json, retry_count, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?)
             """,
-            [video_db_id, job_id, video_id, url, platform, now, now],
+            [
+                video_db_id,
+                job_id,
+                video_id,
+                url,
+                platform,
+                source_meta.get("title") or source_meta.get("desc") or None,
+                duration,
+                published_at,
+                json.dumps(source_meta, ensure_ascii=False),
+                now,
+                now,
+            ],
         )
         return video_db_id
 
@@ -342,6 +367,13 @@ class Database:
         )
 
     def add_artifact(self, job_id: str, kind: str, path: str, video_db_id: str | None = None, meta: dict[str, Any] | None = None) -> None:
+        self.execute(
+            """
+            DELETE FROM artifacts
+            WHERE job_id = ? AND kind = ? AND path = ? AND COALESCE(video_db_id, '') = COALESCE(?, '')
+            """,
+            [job_id, kind, path, video_db_id],
+        )
         self.execute(
             """
             INSERT INTO artifacts (id, job_id, video_db_id, kind, path, meta_json, created_at)

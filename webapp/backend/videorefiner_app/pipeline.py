@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import random
 import re
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -16,21 +18,45 @@ from typing import Any
 from . import __version__
 from .adapters import detect_platform, download_video, extract_frames, extract_video_id, parse_inputs
 from .benchmark import (
+    BENCHMARK_BATCH_SIZE,
     BENCHMARK_PROMPT,
-    build_benchmark_prompt,
-    build_fallback_benchmark_data,
+    CREATOR_MARKDOWN_OUTPUTS,
+    build_creator_markdown_prompt,
+    build_video_batch_prompt,
+    build_video_note_prompt,
     collect_video_materials,
     infer_creator,
     infer_platform,
-    normalize_benchmark_data,
+    model_output_failure,
+    normalize_creator_summary_data,
+    normalize_video_cards_data,
     parse_benchmark_json,
+    remove_benchmark_outputs,
+    validate_benchmark_data,
+    validate_video_batch_data,
     write_benchmark_outputs,
 )
 from .config import AppConfig
 from .db import Database
+from .evidence import (
+    apply_visual_observations,
+    build_visual_observation_prompt,
+    build_visual_timeline,
+    evenly_selected_keyframes,
+    parse_visual_observations,
+    read_visual_timeline,
+    timeline_prompt_summary,
+    transcript_timeline_path,
+    validate_visual_timeline,
+    visual_batches,
+    visual_timeline_path,
+    write_visual_timeline,
+)
 from .llm import LLMClient
+from .metadata import extract_duration_seconds, extract_published_at
+from .metadata_refresh import refresh_job_platform_metadata
 from .security import SecretStore
-from .utils import local_timestamp, run_command, utc_now
+from .utils import list_visible_files, local_timestamp, run_command, utc_now
 from .validation import validate_model_profile_for_refinement
 
 
@@ -56,6 +82,10 @@ DIMENSIONS = SINGLE_VIDEO_DIMENSIONS
 
 
 class JobCancelled(RuntimeError):
+    pass
+
+
+class BenchmarkModelRetryable(RuntimeError):
     pass
 
 
@@ -106,11 +136,12 @@ class PipelineRunner:
         self.single_dir = self.output_dir / "单视频分析"
         self.transcript_dir = self.output_dir / "文案"
         self.keep_dir = self.output_dir / "视频保留"
+        self.evidence_dir = self.output_dir / "evidence"
 
     def run(self) -> None:
         self.db.update_job(self.job_id, status="running", started_at=utc_now(), error=None, cancel_requested=0)
-        self._log("info", "固定流程启动：预检 → 解析输入 → 下载 → 抽帧 → 文案 → 资料检查 → 5个单视频维度蒸馏 → 跨视频合并 → 第6维 Benchmark Intelligence 汇总")
-        for directory in [self.output_dir, self.tmp_dir, self.single_dir, self.transcript_dir, self.keep_dir]:
+        self._log("info", "固定流程启动：预检 → 解析输入 → 下载 → 抽帧 → 文案 → 证据时间线 → 资料检查 → 5个单视频维度蒸馏 → 跨视频合并 → 第6维 Benchmark Intelligence 汇总")
+        for directory in [self.output_dir, self.tmp_dir, self.single_dir, self.transcript_dir, self.keep_dir, self.evidence_dir]:
             directory.mkdir(parents=True, exist_ok=True)
 
         self._check_model_capability()
@@ -118,6 +149,7 @@ class PipelineRunner:
         if not rows:
             raise RuntimeError("未解析到任何视频。")
 
+        self._reactivate_invalid_completed_videos()
         self._process_videos_with_auto_retry()
 
         final_rows = self._get_video_rows()
@@ -160,7 +192,7 @@ class PipelineRunner:
         for item in parsed:
             if str(item["video_id"]) in existing_video_ids:
                 continue
-            video_db_id = self.db.create_video(self.job_id, item["video_id"], item["url"], item["platform"])
+            video_db_id = self.db.create_video(self.job_id, item["video_id"], item["url"], item["platform"], item)
             for dim in DIMENSIONS:
                 self.db.add_dimension(self.job_id, video_db_id, dim["name"])
             row = self.db.query_one("SELECT * FROM videos WHERE id = ?", [video_db_id])
@@ -174,6 +206,41 @@ class PipelineRunner:
 
     def _get_video_rows(self) -> list[dict[str, Any]]:
         return self.db.query_all("SELECT * FROM videos WHERE job_id = ? ORDER BY created_at ASC", [self.job_id])
+
+    def _reactivate_invalid_completed_videos(self) -> None:
+        reactivated = 0
+        requires_evidence = self._requires_visual_evidence()
+        for row in self._get_video_rows():
+            if row["status"] != "done":
+                continue
+            invalid_dimensions: list[tuple[str, str]] = []
+            if requires_evidence:
+                timeline_path = visual_timeline_path(self.evidence_dir, str(row["video_id"]))
+                try:
+                    validate_visual_timeline(read_visual_timeline(timeline_path), require_visual_observations=True)
+                except Exception as exc:
+                    invalid_dimensions.extend((dim["name"], f"视觉证据时间线不可用：{exc}") for dim in DIMENSIONS)
+            for dim in DIMENSIONS:
+                path = self.single_dir / f"{row['video_id']}_{dim['name']}.md"
+                if not path.is_file() or path.stat().st_size == 0:
+                    invalid_dimensions.append((dim["name"], "分析文件缺失或为空"))
+                    continue
+                failure = model_output_failure(path.read_text(encoding="utf-8", errors="ignore"))
+                if failure:
+                    invalid_dimensions.append((dim["name"], f"模型返回无效分析：{failure}"))
+                elif requires_evidence and not self._analysis_has_evidence_refs(path.read_text(encoding="utf-8", errors="ignore"), str(row["video_id"])):
+                    invalid_dimensions.append((dim["name"], "分析缺少可追溯 evidence_id"))
+            if not invalid_dimensions:
+                continue
+            deduped_dimensions = {dimension: error for dimension, error in invalid_dimensions}
+            for dimension, error in deduped_dimensions.items():
+                self.db.update_dimension(self.job_id, row["id"], dimension, "failed", error=error)
+            names = "、".join(deduped_dimensions)
+            self.db.update_video(row["id"], status="pending", error=f"检测到无效维度：{names}", retry_count=0, next_retry_at=None)
+            self._log("warn", f"已完成视频存在无效分析，重新进入补跑：{row['video_id']} / {names}")
+            reactivated += 1
+        if reactivated:
+            self._log("warn", f"共 {reactivated} 个历史完成视频缺少可信证据或维度引用，将补建证据并重跑相关维度")
 
     def _process_videos_with_auto_retry(self) -> None:
         while True:
@@ -244,6 +311,11 @@ class PipelineRunner:
                 "whisper",
                 "文案",
                 "无任何文案来源",
+                "视觉证据批次",
+                "视觉证据模型",
+                "模型分析缺少可追溯 evidence_id",
+                "模型返回无效分析",
+                "json 解析",
             ]
         )
 
@@ -267,6 +339,7 @@ class PipelineRunner:
 
         try:
             self.db.update_video(video_db_id, status="downloading", error=None, skip_reason=None, next_retry_at=None)
+            source_meta = self._source_meta_from_row(row)
             if not video_path.exists() or video_path.stat().st_size <= 1024:
                 self._log("info", f"下载视频：{video_id}")
                 download = download_video(
@@ -276,21 +349,37 @@ class PipelineRunner:
                     self.api_key,
                     source_urls=self.config_snapshot.get("inputs") or [],
                     max_videos=int(self.job["max_videos"]),
+                    source_meta=source_meta,
                 )
             else:
-                download = {"platform": detect_platform(url), "method": "existing", "size_mb": round(video_path.stat().st_size / 1024 / 1024, 2)}
+                download = {
+                    "platform": detect_platform(url),
+                    "method": "existing",
+                    "title": source_meta.get("title") or source_meta.get("desc") or row.get("title") or video_id,
+                    "published_at": extract_published_at(source_meta, row.get("published_at")),
+                    "duration": extract_duration_seconds(source_meta, row.get("duration")),
+                    "size_mb": round(video_path.stat().st_size / 1024 / 1024, 2),
+                }
                 self._log("info", f"复用已下载视频：{video_path}")
+            duration = extract_duration_seconds(download, source_meta, row.get("duration"))
+            if duration is None:
+                duration = self._video_duration_seconds(video_path)
+            published_at = extract_published_at(download, source_meta, row.get("published_at"))
+            merged_meta = self._merge_source_meta(source_meta, download, duration, published_at)
             self.db.update_video(
                 video_db_id,
                 platform=download.get("platform") or detect_platform(url),
                 method=download.get("method"),
                 title=download.get("title") or row.get("title") or video_id,
+                duration=duration,
+                published_at=published_at,
+                source_meta_json=json.dumps(merged_meta, ensure_ascii=False),
             )
             self.db.add_artifact(self.job_id, "video", str(video_path), video_db_id, download)
 
             self.db.update_video(video_db_id, status="framing")
             frame_interval_seconds, frame_interval_mode = self._frame_interval_config(video_path)
-            frames = sorted(frames_dir.glob("*.jpg"))
+            frames = list_visible_files(frames_dir, "*.jpg")
             if frames and not self._frames_match_task_config(frames_dir, frame_interval_seconds):
                 self._log("warn", f"{video_id} 现有帧图间隔与当前任务不一致，将重新抽帧")
                 shutil.rmtree(frames_dir)
@@ -321,8 +410,10 @@ class PipelineRunner:
                 self._log("warn", f"{video_id} 资料不全，跳过蒸馏：{reason}")
                 return self.db.query_one("SELECT * FROM videos WHERE id = ?", [video_db_id])
 
+            self.db.update_video(video_db_id, status="evidencing")
+            evidence = self._ensure_visual_evidence(video_db_id, video_id, video_path, frames_dir, raw_transcript_path)
             self.db.update_video(video_db_id, status="distilling")
-            self._distill_video(video_db_id, video_id, frames_dir, frames, row, transcript)
+            self._distill_video(video_db_id, video_id, frames_dir, frames, row, transcript, evidence)
             keep_path = self.keep_dir / f"{video_id}.mp4"
             if not keep_path.exists():
                 shutil.copy2(video_path, keep_path)
@@ -369,6 +460,40 @@ class PipelineRunner:
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
         return duration if duration > 0 else None
+
+    def _source_meta_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        source_meta: dict[str, Any] = {}
+        if row.get("source_meta_json"):
+            try:
+                parsed = json.loads(row["source_meta_json"] or "{}")
+                if isinstance(parsed, dict):
+                    source_meta = parsed
+            except json.JSONDecodeError:
+                source_meta = {}
+        if row.get("title") and not source_meta.get("title"):
+            source_meta["title"] = row["title"]
+        if row.get("duration") and not extract_duration_seconds(source_meta):
+            source_meta["duration"] = row["duration"]
+        if row.get("published_at") and not extract_published_at(source_meta):
+            source_meta["published_at"] = row["published_at"]
+        return source_meta
+
+    def _merge_source_meta(
+        self,
+        source_meta: dict[str, Any],
+        download: dict[str, Any],
+        duration: float | None,
+        published_at: str | None,
+    ) -> dict[str, Any]:
+        merged = dict(source_meta)
+        for key in ("title", "desc", "method", "play_url", "download_url"):
+            if download.get(key) not in (None, ""):
+                merged[key] = download[key]
+        if duration is not None:
+            merged["duration"] = duration
+        if published_at:
+            merged["published_at"] = published_at
+        return merged
 
     def _frames_match_task_config(self, frames_dir: Path, frame_interval_seconds: int) -> bool:
         meta_path = frames_dir / "frames_meta.json"
@@ -470,15 +595,23 @@ class PipelineRunner:
         frames: list[Path],
         row: dict[str, Any],
         transcript: str,
+        evidence: dict[str, Any],
     ) -> None:
-        selected = self._select_frames(frames)
+        selected = self._evidence_frame_paths(evidence, frames)
+        visual_summary = timeline_prompt_summary(evidence)
         for dim in DIMENSIONS:
             self._check_cancelled()
             output_path = self.single_dir / f"{video_id}_{dim['name']}.md"
             if output_path.exists() and output_path.stat().st_size > 0:
-                self.db.update_dimension(self.job_id, video_db_id, dim["name"], "done", output_path=str(output_path), error=None)
-                self._log("info", f"复用已完成维度：{video_id} / {dim['name']}")
-                continue
+                existing = output_path.read_text(encoding="utf-8", errors="ignore")
+                existing_error = model_output_failure(existing)
+                if not existing_error and self._analysis_has_evidence_refs(existing, video_id):
+                    self.db.update_dimension(self.job_id, video_db_id, dim["name"], "done", output_path=str(output_path), error=None)
+                    self._log("info", f"复用已完成维度：{video_id} / {dim['name']}")
+                    continue
+                reason = existing_error or "缺少证据引用"
+                self._log("warn", f"检测到无效旧分析，重新生成：{video_id} / {dim['name']}（{reason}）")
+                output_path.unlink()
             try:
                 self.db.update_dimension(self.job_id, video_db_id, dim["name"], "running", error=None)
                 prompt = (self.config.prompts_dir / dim["prompt"]).read_text(encoding="utf-8")
@@ -489,7 +622,15 @@ class PipelineRunner:
                     f"- 视频ID：{video_id}\n"
                 )
                 analysis_transcript = self._analysis_transcript(video_id, transcript)
-                text_blocks = [prompt, info, f"---\n完整文案（已验证+标点分段，必要时已按头中尾采样）：\n{analysis_transcript}\n"]
+                text_blocks = [
+                    prompt,
+                    info,
+                    f"---\n完整文案（已验证+标点分段，必要时已按头中尾采样）：\n{analysis_transcript}\n",
+                    "---\n已验证视觉证据时间线：以下条目中的 evidence_id、时间范围、画面描述和文案摘录可作为事实依据。"
+                    "不得从静态图推断声音、完整台词或连续运镜；没有足够证据时必须写明未确认。"
+                    "每个关键视觉、剪辑或脚本结论请在句末标注至少一个 evidence_id。\n"
+                    + visual_summary,
+                ]
                 self._log("info", f"蒸馏维度：{video_id} / {dim['name']}")
                 analysis = self.llm.chat_multimodal(
                     self.profile["analysis_model"],
@@ -497,13 +638,116 @@ class PipelineRunner:
                     selected,
                     max_tokens=int(self.profile.get("max_tokens") or 8192),
                 )
-                output_path.write_text(analysis or "分析返回为空", encoding="utf-8")
+                analysis_error = model_output_failure(analysis)
+                if analysis_error:
+                    raise RuntimeError(f"模型返回无效分析：{analysis_error}")
+                if not self._analysis_has_evidence_refs(analysis, video_id):
+                    raise RuntimeError("模型分析缺少可追溯 evidence_id")
+                output_path.write_text(analysis, encoding="utf-8")
                 self.db.update_dimension(self.job_id, video_db_id, dim["name"], "done", output_path=str(output_path), error=None)
                 self.db.add_artifact(self.job_id, "single_analysis", str(output_path), video_db_id, {"dimension": dim["name"]})
                 self._delay_between_dimensions(dim != DIMENSIONS[-1])
             except Exception as exc:
                 self.db.update_dimension(self.job_id, video_db_id, dim["name"], "failed", error=str(exc))
                 raise RuntimeError(f"{dim['name']} 蒸馏失败：{exc}") from exc
+
+    def _ensure_visual_evidence(
+        self,
+        video_db_id: str,
+        video_id: str,
+        video_path: Path,
+        frames_dir: Path,
+        raw_transcript_path: Path,
+    ) -> dict[str, Any]:
+        path = visual_timeline_path(self.evidence_dir, video_id)
+        if path.exists():
+            try:
+                timeline = read_visual_timeline(path)
+                validate_visual_timeline(timeline, require_visual_observations=True)
+                self._log("info", f"复用已完成证据时间线：{video_id}")
+                return timeline
+            except Exception as exc:
+                self._log("warn", f"{video_id} 旧证据时间线不可用，将重新生成：{exc}")
+
+        self._log("info", f"构建证据时间线：{video_id}")
+        timeline = build_visual_timeline(
+            video_id,
+            video_path,
+            frames_dir,
+            transcript_timeline_path(raw_transcript_path),
+            self.evidence_dir,
+            self.config.ffmpeg_bin,
+            duration_seconds=self._video_duration_seconds(video_path),
+        )
+        existing: dict[str, dict[str, str]] = {}
+        for shot in timeline.get("shots", []):
+            observation = shot.get("visual_observation")
+            if isinstance(observation, dict) and str(observation.get("visual_description") or "").strip():
+                existing[str(shot["evidence_id"])] = {key: str(value) for key, value in observation.items()}
+
+        pending = [shot for shot in timeline["shots"] if str(shot["evidence_id"]) not in existing]
+        for batch_index, batch in enumerate(visual_batches({"shots": pending}), start=1):
+            self._check_cancelled()
+            expected_ids = {str(shot["evidence_id"]) for shot in batch}
+            image_paths = [self.output_dir / str(shot["keyframe"]) for shot in batch]
+            if any(not image.exists() for image in image_paths):
+                missing = [str(image) for image in image_paths if not image.exists()]
+                raise RuntimeError("证据关键帧不存在：" + "、".join(missing[:3]))
+            prompt = build_visual_observation_prompt(video_id, batch)
+            last_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    self._log("info", f"视觉证据标注：{video_id}，批次 {batch_index}，第 {attempt + 1} 次")
+                    raw = self.llm.chat_multimodal(
+                        self.profile["analysis_model"],
+                        [prompt],
+                        image_paths,
+                        max_tokens=min(4096, int(self.profile.get("max_tokens") or 8192)),
+                    )
+                    failure = model_output_failure(raw)
+                    if failure:
+                        raise ValueError(f"模型返回失败响应：{failure}")
+                    existing.update(parse_visual_observations(raw, expected_ids))
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        self._log("warn", f"视觉证据批次 {batch_index} 未通过校验，自动重试：{exc}")
+            else:
+                raise RuntimeError(f"视觉证据批次 {batch_index} 连续两次未通过校验：{last_error}")
+
+        timeline = apply_visual_observations(timeline, existing)
+        write_visual_timeline(path, timeline)
+        self.db.add_artifact(
+            self.job_id,
+            "visual_timeline",
+            str(path),
+            video_db_id,
+            {
+                "video_id": video_id,
+                "shot_count": len(timeline.get("shots") or []),
+                "transcript_alignment": timeline.get("quality", {}).get("transcript_alignment"),
+                "detected_cut_segment_count": sum(
+                    1 for shot in timeline.get("shots", []) if shot.get("segment_type") == "detected_cut_segment"
+                ),
+                "eligible_for_precise_timing": timeline.get("quality", {}).get("eligible_for_precise_timing"),
+            },
+        )
+        self._log("info", f"证据时间线完成：{video_id}，{len(timeline.get('shots') or [])} 个镜头")
+        return timeline
+
+    def _evidence_frame_paths(self, evidence: dict[str, Any], fallback_frames: list[Path]) -> list[Path]:
+        paths = [self.output_dir / path for path in evenly_selected_keyframes(evidence, self.config.max_dimension_frames)]
+        paths = [path for path in paths if path.exists()]
+        return paths or self._select_frames(fallback_frames)
+
+    @staticmethod
+    def _analysis_has_evidence_refs(text: str, video_id: str) -> bool:
+        return f"video:{video_id}:shot:" in text
+
+    def _requires_visual_evidence(self) -> bool:
+        snapshot = getattr(self, "config_snapshot", {})
+        return int(snapshot.get("evidence_timeline_version") or 0) >= 1
 
     def _merge_outputs(self, video_rows: list[dict[str, Any]]) -> None:
         self._log("info", "开始合并精炼")
@@ -558,6 +802,7 @@ class PipelineRunner:
     def _write_benchmark_intelligence(self, video_rows: list[dict[str, Any]]) -> None:
         prompt_path = self.config.prompts_dir / BENCHMARK_PROMPT
         prompt_template = prompt_path.read_text(encoding="utf-8")
+        video_rows = self._ensure_video_metadata(video_rows)
         creator = infer_creator(self.output_dir, self.config_snapshot)
         platform = infer_platform(video_rows)
         materials = collect_video_materials(
@@ -567,52 +812,268 @@ class PipelineRunner:
             self.tmp_dir,
             self.keep_dir,
             DIMENSIONS,
-            min(self.config.max_merge_chars_per_video, 2000),
+            min(max(self.config.max_merge_chars_per_video, 1200), 2000),
+            self.evidence_dir,
+            require_visual_evidence=self._requires_visual_evidence(),
         )
         if not materials:
             self._log("warn", "没有可用于 Benchmark Intelligence 的完成视频，跳过新版结构化产物。")
             return
 
-        self._log("info", "蒸馏维度：Benchmark Intelligence 汇总")
-        self._log("info", "生成 Benchmark Intelligence 结构化产物")
         legacy_outputs = self._legacy_output_paths()
-        prompt = build_benchmark_prompt(
-            prompt_template,
-            creator,
-            platform,
-            materials,
-            legacy_outputs,
-            max(self.config.max_merge_chars_per_video, 4000),
-        )
-        try:
-            raw = self.llm.chat_text(
-                self.profile["merge_model"],
-                prompt,
-                max_tokens=max(8192, int(self.profile.get("max_tokens") or 8192)),
-                reasoning=bool(self.profile.get("supports_reasoning")),
-            )
-        except Exception as exc:
-            if self.profile.get("supports_reasoning"):
-                self._log("warn", f"reasoning Benchmark 汇总失败，关闭 reasoning 重试：{exc}")
-                raw = self.llm.chat_text(
-                    self.profile["merge_model"],
-                    prompt,
-                    max_tokens=max(8192, int(self.profile.get("max_tokens") or 8192)),
-                    reasoning=False,
+        attempt = 1
+        while True:
+            self._check_cancelled()
+            try:
+                self._log("info", f"蒸馏维度：Benchmark Intelligence 汇总（第 {attempt} 次）")
+                self._write_benchmark_intelligence_once(prompt_template, creator, platform, materials, legacy_outputs)
+                self.db.update_job(self.job_id, error=None)
+                return
+            except BenchmarkModelRetryable as exc:
+                delay = self._auto_retry_delay_seconds()
+                message = (
+                    "Benchmark Intelligence 云端模型输出未通过质量校验，"
+                    f"已停止写入结构化产物，等待 {delay:.1f} 秒后自动重试第 {attempt + 1} 次：{exc}"
                 )
-            else:
-                raise
+                self.db.update_job(self.job_id, status="running", error=message)
+                self._log("warn", message)
+                self._sleep_interruptible(delay)
+                attempt += 1
+
+    def _ensure_video_metadata(self, video_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        needs_published_at = any(
+            not extract_published_at(row.get("published_at"), self._source_meta_from_row(row)) for row in video_rows
+        )
+        if needs_published_at:
+            refresh_job_platform_metadata(self.db, self.job_id, self.output_dir, self._log)
+            video_rows = self.db.query_all("SELECT * FROM videos WHERE job_id = ? ORDER BY created_at ASC", [self.job_id])
+        updated_rows: list[dict[str, Any]] = []
+        duration_updates = 0
+        published_updates = 0
+        for row in video_rows:
+            row = dict(row)
+            source_meta = self._source_meta_from_row(row)
+            duration = extract_duration_seconds(row.get("duration"), source_meta)
+            if duration is None:
+                video_path = self.tmp_dir / f"{row['video_id']}.mp4"
+                if video_path.exists() and video_path.stat().st_size > 1024:
+                    duration = self._video_duration_seconds(video_path)
+            published_at = extract_published_at(row.get("published_at"), source_meta)
+
+            changes: dict[str, Any] = {}
+            if duration is not None and not row.get("duration"):
+                changes["duration"] = duration
+                row["duration"] = duration
+                duration_updates += 1
+            if published_at and not row.get("published_at"):
+                changes["published_at"] = published_at
+                row["published_at"] = published_at
+                published_updates += 1
+            if changes:
+                merged_meta = self._merge_source_meta(source_meta, {}, duration, published_at)
+                changes["source_meta_json"] = json.dumps(merged_meta, ensure_ascii=False)
+                self.db.update_video(row["id"], **changes)
+                row["source_meta_json"] = changes["source_meta_json"]
+            updated_rows.append(row)
+
+        if duration_updates or published_updates:
+            self._log("info", f"已补充视频元数据：时长 {duration_updates} 条，发布时间 {published_updates} 条")
+        return updated_rows
+
+    def _write_benchmark_intelligence_once(
+        self,
+        prompt_template: str,
+        creator: str,
+        platform: str,
+        materials: list[Any],
+        legacy_outputs: dict[str, Path],
+    ) -> None:
+        remove_benchmark_outputs(self.output_dir)
+        self.db.execute(
+            """
+            DELETE FROM artifacts
+            WHERE job_id = ? AND kind IN (
+                'benchmark_profile', 'benchmark_pattern_library', 'benchmark_qa_checklist',
+                'retrieval_pack', 'video_card', 'video_notes', 'retrieval_index',
+                'raw_refs', 'legacy_output'
+            )
+            """,
+            [self.job_id],
+        )
+        self._log("info", f"生成 Benchmark Intelligence 结构化产物：每批 {BENCHMARK_BATCH_SIZE} 个视频")
+        cards: list[dict[str, Any]] = []
+        notes: dict[str, str] = {}
+        batches = [materials[index : index + BENCHMARK_BATCH_SIZE] for index in range(0, len(materials), BENCHMARK_BATCH_SIZE)]
+        for batch_index, batch in enumerate(batches, start=1):
+            self._check_cancelled()
+            self._log("info", f"Benchmark 视频卡片批次 {batch_index}/{len(batches)}")
+            prompt = build_video_batch_prompt(prompt_template, creator, platform, batch)
+            try:
+                batch_data = self._benchmark_json_call(
+                    prompt,
+                    f"视频卡片批次 {batch_index}",
+                    lambda parsed, current_batch=batch: normalize_video_cards_data(parsed, creator, platform, current_batch),
+                )
+            except Exception as exc:
+                raise BenchmarkModelRetryable(f"视频卡片批次 {batch_index} 连续失败：{exc}") from exc
+            batch_cards = batch_data["video_cards"]
+            cards.extend(batch_cards)
+            cards_by_id = {str(card["video_id"]): card for card in batch_cards}
+            for material in batch:
+                card = cards_by_id[material.video_id]
+                try:
+                    notes[material.video_id] = self._benchmark_video_note_call(
+                        prompt_template,
+                        creator,
+                        platform,
+                        material,
+                        card,
+                    )
+                except Exception as exc:
+                    raise BenchmarkModelRetryable(f"视频笔记 {material.video_id} 连续失败：{exc}") from exc
 
         try:
-            parsed = parse_benchmark_json(raw)
-            data = normalize_benchmark_data(parsed, creator, platform, materials)
+            creator_data = self._benchmark_creator_markdown_calls(
+                prompt_template, creator, platform, cards, notes, materials, legacy_outputs
+            )
         except Exception as exc:
-            self._log("warn", f"Benchmark Intelligence JSON 解析失败，使用规则兜底结构：{exc}")
-            data = build_fallback_benchmark_data(creator, platform, materials)
+            raise BenchmarkModelRetryable(f"账号级文档连续失败：{exc}") from exc
+        data = {**creator_data, "video_cards": cards, "video_notes": notes}
+        try:
+            validate_benchmark_data(data, materials)
+        except Exception as exc:
+            raise BenchmarkModelRetryable(f"最终结构化产物质量校验失败：{exc}") from exc
 
         for artifact in write_benchmark_outputs(self.output_dir, creator, platform, data, materials, legacy_outputs):
             self.db.add_artifact(self.job_id, artifact["kind"], str(artifact["path"]), None, artifact.get("meta"))
         self._log("info", "Benchmark Intelligence 结构化产物已生成")
+
+    def _benchmark_video_note_call(
+        self,
+        prompt_template: str,
+        creator: str,
+        platform: str,
+        material: Any,
+        card: dict[str, Any],
+    ) -> str:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                self._check_cancelled()
+                self._log("info", f"Benchmark 视频笔记：{material.video_id}")
+                prompt = build_video_note_prompt(prompt_template, creator, platform, material, card)
+                if attempt:
+                    prompt += "\n\n上次 Notes 未通过内容核验。请补足脚本、视觉、运营、证据方法段落，并引用稳定 evidence_id。"
+                note = self._benchmark_text_call(prompt, f"视频笔记 {material.video_id}")
+                validate_video_batch_data({"video_cards": [card], "video_notes": {material.video_id: note}}, [material])
+                return note
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    self._log("warn", f"Benchmark 视频笔记 {material.video_id} 未通过校验，自动重试：{exc}")
+        raise RuntimeError(f"Benchmark 视频笔记 {material.video_id} 连续两次未通过校验：{last_error}")
+
+    def _benchmark_creator_markdown_calls(
+        self,
+        prompt_template: str,
+        creator: str,
+        platform: str,
+        cards: list[dict[str, Any]],
+        notes: dict[str, str],
+        materials: list[Any],
+        legacy_outputs: dict[str, Path],
+    ) -> dict[str, str]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            data: dict[str, str] = {}
+            try:
+                for output_key, spec in CREATOR_MARKDOWN_OUTPUTS.items():
+                    self._check_cancelled()
+                    self._log("info", f"Benchmark 账号级文档：{spec['title']}")
+                    prompt = build_creator_markdown_prompt(
+                        prompt_template,
+                        creator,
+                        platform,
+                        cards,
+                        legacy_outputs,
+                        max(self.config.max_merge_chars_per_video, 4000),
+                        output_key,
+                    )
+                    if attempt:
+                        prompt += "\n\n上次账号级文档未通过内容核验。请补足真实 video_id、证据引用、方法总结和风险边界。"
+                    data[output_key] = self._benchmark_text_call(prompt, spec["title"], timeout_seconds=180)
+                creator_result = normalize_creator_summary_data(data)
+                validate_benchmark_data({**creator_result, "video_cards": cards, "video_notes": notes}, materials)
+                return creator_result
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    self._log("warn", f"Benchmark 账号级文档未通过校验，自动重试：{exc}")
+        raise RuntimeError(f"Benchmark 账号级文档连续两次未通过校验：{last_error}")
+
+    def _benchmark_text_call(self, prompt: str, label: str, timeout_seconds: int | None = None) -> str:
+        def call_model() -> str:
+            return self.llm.chat_text(
+                self.profile["merge_model"],
+                prompt,
+                max_tokens=max(4096, int(self.profile.get("max_tokens") or 8192)),
+                reasoning=False,
+            ).strip()
+
+        raw = self._call_with_timeout(call_model, timeout_seconds, label) if timeout_seconds else call_model()
+        failure = model_output_failure(raw)
+        if failure:
+            raise ValueError(f"{label} 模型返回失败响应：{failure}")
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+        return raw
+
+    def _call_with_timeout(self, func: Callable[[], str], timeout_seconds: int | None, label: str) -> str:
+        if not timeout_seconds:
+            return func()
+        result_queue: queue.Queue[tuple[str, str | BaseException]] = queue.Queue(maxsize=1)
+
+        def runner() -> None:
+            try:
+                result_queue.put(("ok", func()))
+            except BaseException as exc:
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        try:
+            status, payload = result_queue.get(timeout=timeout_seconds)
+        except queue.Empty as exc:
+            raise TimeoutError(f"{label} 模型调用超过 {timeout_seconds} 秒未返回") from exc
+        if status == "error":
+            raise payload
+        return str(payload)
+
+    def _benchmark_json_call(
+        self,
+        prompt: str,
+        label: str,
+        normalize: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            retry_prompt = prompt if attempt == 0 else prompt + "\n\n上次结果未通过 schema/内容校验。请重新完整返回合法 JSON，不要解释。"
+            try:
+                raw = self.llm.chat_text(
+                    self.profile["merge_model"],
+                    retry_prompt,
+                    max_tokens=max(8192, int(self.profile.get("max_tokens") or 8192)),
+                    reasoning=bool(self.profile.get("supports_reasoning")) and attempt == 0,
+                )
+                failure = model_output_failure(raw)
+                if failure:
+                    raise ValueError(f"模型返回失败响应：{failure}")
+                return normalize(parse_benchmark_json(raw))
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    self._log("warn", f"Benchmark {label} 未通过校验，自动重试：{exc}")
+        raise RuntimeError(f"Benchmark {label} 连续两次未通过校验：{last_error}")
 
     def _legacy_output_paths(self) -> dict[str, Path]:
         return {dim["name"]: self.output_dir / dim["output"] for dim in DIMENSIONS}
@@ -678,6 +1139,7 @@ class PipelineRunner:
                 "download",
                 "frames",
                 "transcript",
+                "visual_evidence",
                 "material_check",
                 "distill",
                 "merge",
@@ -730,6 +1192,7 @@ def config_snapshot(config: AppConfig, inputs: list[str], extra: dict[str, Any] 
     data = asdict(config)
     data = {key: str(value) if isinstance(value, Path) else value for key, value in data.items()}
     data["inputs"] = inputs
+    data["evidence_timeline_version"] = 1
     if extra:
         data.update(extra)
     return data

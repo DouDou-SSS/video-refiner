@@ -131,15 +131,95 @@ def _soft_subtitles(video_path: Path, work_dir: Path, ffmpeg_bin: str) -> str:
     return _sidecar_subtitles(video_path) or _embedded_subtitles(video_path, work_dir, ffmpeg_bin)
 
 
-def _ocr_bottom_frames(frames_dir: Path, bottom_ratio: float = 0.35) -> tuple[str, dict[str, Any]]:
+def _subtitle_timeline_from_file(path: Path) -> list[dict[str, Any]]:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    if path.suffix.lower() in {".ass", ".ssa"}:
+        result = []
+        for line in raw.splitlines():
+            if not line.startswith("Dialogue:"):
+                continue
+            parts = line.split(",", 9)
+            if len(parts) != 10:
+                continue
+            start = _subtitle_stamp_seconds(parts[1])
+            end = _subtitle_stamp_seconds(parts[2])
+            text = _normalize_text(parts[-1])
+            if text and start is not None and end is not None:
+                result.append({"start_seconds": start, "end_seconds": end, "text": text, "source": "soft_subtitle", "timing": "timed"})
+        return result
+
+    result: list[dict[str, Any]] = []
+    block: list[str] = []
+    for line in [*raw.splitlines(), ""]:
+        if line.strip():
+            block.append(line.strip())
+            continue
+        timing_index = next((index for index, value in enumerate(block) if "-->" in value), None)
+        if timing_index is not None:
+            parts = block[timing_index].split("-->", 1)
+            start = _subtitle_stamp_seconds(parts[0])
+            end = _subtitle_stamp_seconds(parts[1])
+            text = _normalize_text(" ".join(block[timing_index + 1 :]))
+            if text and start is not None and end is not None:
+                result.append({"start_seconds": start, "end_seconds": end, "text": text, "source": "soft_subtitle", "timing": "timed"})
+        block = []
+    return result
+
+
+def _subtitle_stamp_seconds(raw: str) -> float | None:
+    match = re.search(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[,.](\d{1,3}))?", raw.strip())
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    milliseconds = int((match.group(4) or "0").ljust(3, "0")[:3])
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
+
+
+def _soft_subtitle_timeline(video_path: Path, work_dir: Path) -> list[dict[str, Any]]:
+    candidates: list[Path] = []
+    for suffix in SUBTITLE_SUFFIXES:
+        candidates.extend(
+            [
+                video_path.with_suffix(suffix),
+                video_path.parent / f"{video_path.stem}.zh{suffix}",
+                video_path.parent / f"{video_path.stem}.zh-CN{suffix}",
+                work_dir / f"{video_path.stem}_embedded{suffix}",
+            ]
+        )
+    for path in candidates:
+        if path.exists():
+            segments = _subtitle_timeline_from_file(path)
+            if segments:
+                return segments
+    return []
+
+
+def _frame_interval_seconds(frames_dir: Path) -> float:
+    try:
+        meta = json.loads((frames_dir / "frames_meta.json").read_text(encoding="utf-8"))
+        return max(float(meta.get("frame_interval_seconds") or 1), 0.1)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 1.0
+
+
+def _frame_timestamp(frame_path: Path, interval_seconds: float) -> float:
+    match = re.search(r"(\d+)(?=\.[^.]+$)", frame_path.name)
+    return max(0.0, (int(match.group(1)) - 1) * interval_seconds) if match else 0.0
+
+
+def _ocr_bottom_frames(frames_dir: Path, bottom_ratio: float = 0.35) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     from PIL import Image
     from rapidocr_onnxruntime import RapidOCR
 
     engine = RapidOCR()
     lines: list[str] = []
+    timeline: list[dict[str, Any]] = []
     used_count = 0
     ratio = min(max(bottom_ratio, 0.1), 0.6)
-    frames = sorted(frames_dir.glob("*.jpg"))
+    interval_seconds = _frame_interval_seconds(frames_dir)
+    frames = sorted(path for path in frames_dir.glob("*.jpg") if path.is_file() and not path.name.startswith("."))
     total_frames = len(frames)
     max_frames = int(os.environ.get("VIDEO_REFINER_OCR_MAX_FRAMES", "240"))
     if max_frames > 0 and total_frames > max_frames:
@@ -159,6 +239,16 @@ def _ocr_bottom_frames(frames_dir: Path, bottom_ratio: float = 0.35) -> tuple[st
             frame_text = _normalize_text(" ".join(texts))
             if frame_text:
                 lines.append(frame_text)
+                timestamp = _frame_timestamp(frame_path, interval_seconds)
+                timeline.append(
+                    {
+                        "start_seconds": timestamp,
+                        "end_seconds": timestamp + interval_seconds,
+                        "text": frame_text,
+                        "source": "ocr",
+                        "timing": "timed",
+                    }
+                )
                 used_count += 1
 
     deduped = _dedupe_lines(lines)
@@ -168,7 +258,7 @@ def _ocr_bottom_frames(frames_dir: Path, bottom_ratio: float = 0.35) -> tuple[st
         "ocr_frames_sampled": len(frames),
         "ocr_frames_with_text": used_count,
         "ocr_lines": len(deduped),
-    }
+    }, timeline
 
 
 def _ocr_hotwords(ocr_text: str, limit: int = 300) -> str:
@@ -204,7 +294,7 @@ def _ocr_is_primary_source(ocr_text: str, ocr_meta: dict[str, Any]) -> bool:
     return len(ocr_text.strip()) >= min_chars and frames_with_text >= min_text_frames and frame_ratio >= min_text_frame_ratio
 
 
-def _whisper(video_path: Path, ocr_reference: str, ffmpeg_bin: str, segments_dir: Path) -> tuple[str, str, dict[str, Any]]:
+def _whisper(video_path: Path, ocr_reference: str, ffmpeg_bin: str, segments_dir: Path) -> tuple[str, str, dict[str, Any], list[dict[str, Any]]]:
     from faster_whisper import WhisperModel
 
     duration_seconds = _media_duration(video_path, ffmpeg_bin)
@@ -237,7 +327,7 @@ def _whisper(video_path: Path, ocr_reference: str, ffmpeg_bin: str, segments_dir
             )
             model_label = Path(model_size).name if Path(model_size).exists() else model_size
             if duration_seconds and duration_seconds > long_video_seconds:
-                text, count = _transcribe_segmented(
+                text, count, timeline = _transcribe_segmented(
                     model,
                     video_path,
                     ffmpeg_bin,
@@ -253,21 +343,21 @@ def _whisper(video_path: Path, ocr_reference: str, ffmpeg_bin: str, segments_dir
                     "whisper_segment_seconds": max(60, segment_seconds),
                     "whisper_segments": count,
                     "whisper_segments_dir": str(segments_dir),
-                }
-            text, whisper_mode = _transcribe_with_fallback(model, video_path, prompt, hotwords)
+                }, timeline
+            text, whisper_mode, timeline = _transcribe_timed_with_fallback(model, video_path, prompt, hotwords)
             audio_fallback = False
             if not text.strip():
                 with tempfile.TemporaryDirectory(prefix="video-refiner-whisper-audio-") as tmp:
                     audio_path = Path(tmp) / f"{video_path.stem}.wav"
                     _extract_audio(video_path, audio_path, ffmpeg_bin, duration_seconds)
-                    text, whisper_mode = _transcribe_with_fallback(model, audio_path, prompt, hotwords)
+                    text, whisper_mode, timeline = _transcribe_timed_with_fallback(model, audio_path, prompt, hotwords)
                     audio_fallback = True
             return text, model_label, {
                 "whisper_long_video": False,
                 "whisper_duration_seconds": round(duration_seconds, 2) if duration_seconds else None,
                 "whisper_audio_fallback": audio_fallback,
                 "whisper_decode_mode": whisper_mode,
-            }
+            }, timeline
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"Whisper 转写失败：{last_error}")
@@ -308,6 +398,59 @@ def _transcribe_with_fallback(model: Any, media_path: Path, prompt: str, hotword
         raise RuntimeError(f"高精度参数失败：{high_error}; 简单参数失败：{simple_exc}") from simple_exc
 
 
+def _transcribe_timed_with_fallback(
+    model: Any,
+    media_path: Path,
+    prompt: str,
+    hotwords: str,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    try:
+        text, timeline = _transcribe_timed_with_whisper(model, media_path, prompt, hotwords, "high")
+        return text, "high", timeline
+    except Exception as exc:
+        high_error = exc
+    try:
+        text, timeline = _transcribe_timed_with_whisper(model, media_path, "", "", "simple")
+        return text, "simple", timeline
+    except Exception as simple_exc:
+        raise RuntimeError(f"高精度参数失败：{high_error}; 简单参数失败：{simple_exc}") from simple_exc
+
+
+def _transcribe_timed_with_whisper(
+    model: Any,
+    video_path: Path,
+    prompt: str,
+    hotwords: str,
+    mode: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    if mode == "simple":
+        kwargs = {"language": "zh", "beam_size": int(os.environ.get("VIDEO_REFINER_WHISPER_SIMPLE_BEAM_SIZE", "5"))}
+    else:
+        kwargs = {
+            "language": "zh",
+            "beam_size": int(os.environ.get("VIDEO_REFINER_WHISPER_BEAM_SIZE", "8")),
+            "best_of": int(os.environ.get("VIDEO_REFINER_WHISPER_BEST_OF", "8")),
+            "patience": float(os.environ.get("VIDEO_REFINER_WHISPER_PATIENCE", "1.2")),
+            "temperature": [0.0, 0.2, 0.4],
+            "condition_on_previous_text": True,
+            "vad_filter": False,
+            "no_speech_threshold": 0.35,
+            "compression_ratio_threshold": 2.4,
+            "log_prob_threshold": -1.0,
+            "initial_prompt": prompt or None,
+            "hotwords": hotwords or None,
+        }
+    segments, _ = model.transcribe(str(video_path), **kwargs)
+    timeline: list[dict[str, Any]] = []
+    for segment in segments:
+        text = str(getattr(segment, "text", "") or "").strip()
+        start = float(getattr(segment, "start", 0.0) or 0.0)
+        end = float(getattr(segment, "end", start) or start)
+        if text and end >= start:
+            timeline.append({"start_seconds": start, "end_seconds": end, "text": text, "source": "whisper", "timing": "timed"})
+    return " ".join(item["text"] for item in timeline).strip(), timeline
+
+
 def _transcribe_with_whisper(model: Any, video_path: Path, prompt: str, hotwords: str, mode: str) -> str:
     if mode == "simple":
         kwargs = {
@@ -342,10 +485,11 @@ def _transcribe_segmented(
     segment_seconds: int,
     prompt: str,
     hotwords: str,
-) -> tuple[str, int]:
+) -> tuple[str, int, list[dict[str, Any]]]:
     segments_dir.mkdir(parents=True, exist_ok=True)
     segment_count = int((duration_seconds + segment_seconds - 1) // segment_seconds)
     parts: list[str] = []
+    timeline: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="video-refiner-whisper-segments-") as tmp:
         tmp_dir = Path(tmp)
         for index in range(segment_count):
@@ -384,7 +528,17 @@ def _transcribe_segmented(
                 segment_text, _ = _transcribe_with_fallback(model, audio_path, prompt, hotwords)
                 text_path.write_text(segment_text, encoding="utf-8")
             parts.append(f"[{_format_stamp(start)}-{_format_stamp(start + length)}]\n{segment_text}")
-    return "\n\n".join(parts).strip(), segment_count
+            if segment_text.strip():
+                timeline.append(
+                    {
+                        "start_seconds": start,
+                        "end_seconds": start + length,
+                        "text": segment_text.strip(),
+                        "source": "whisper",
+                        "timing": "timed",
+                    }
+                )
+    return "\n\n".join(parts).strip(), segment_count, timeline
 
 
 def _media_duration(video_path: Path, ffmpeg_bin: str) -> float | None:
@@ -455,6 +609,38 @@ def _write_sidecar(output: Path, suffix: str, text: str) -> str:
     return str(path)
 
 
+def _write_timeline_sidecar(output: Path, segments: list[dict[str, Any]], source: str, duration_seconds: float | None) -> str:
+    path = output.with_name(f"{output.stem}_timeline.json")
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "video-refiner.transcript_timeline.v1",
+                "source": source,
+                "duration_seconds": duration_seconds,
+                "segments": segments,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def _coarse_timeline(text: str, source: str, duration_seconds: float | None) -> list[dict[str, Any]]:
+    if not text.strip():
+        return []
+    return [
+        {
+            "start_seconds": 0,
+            "end_seconds": float(duration_seconds or 0),
+            "text": text.strip(),
+            "source": source,
+            "timing": "coarse",
+        }
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="video-refiner media worker")
     parser.add_argument("--video-id", required=True)
@@ -470,16 +656,20 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     meta: dict[str, Any] = {"video_id": args.video_id, "extraction_version": 2}
+    duration_seconds = _media_duration(video_path, args.ffmpeg_bin)
     soft_text = _soft_subtitles(video_path, output.parent, args.ffmpeg_bin)
+    timeline_segments: list[dict[str, Any]] = []
     if soft_text:
         source = "软字幕"
         raw_text = soft_text
+        timeline_segments = _soft_subtitle_timeline(video_path, output.parent)
         meta["soft_subtitle_chars"] = len(soft_text)
         meta["soft_subtitle_path"] = _write_sidecar(output, "soft_subtitle", soft_text)
     else:
         ocr_text = ""
+        ocr_segments: list[dict[str, Any]] = []
         try:
-            ocr_text, ocr_meta = _ocr_bottom_frames(frames_dir)
+            ocr_text, ocr_meta, ocr_segments = _ocr_bottom_frames(frames_dir)
             meta.update(ocr_meta)
         except Exception as exc:
             meta["ocr_error"] = str(exc)[:300]
@@ -489,11 +679,12 @@ def main() -> None:
         if ocr_text and _ocr_is_primary_source(ocr_text, meta):
             raw_text = ocr_text
             source = "底部硬字幕OCR主文案"
+            timeline_segments = ocr_segments
             meta["ocr_primary_source"] = True
         else:
             segments_dir = output.parent / f"{args.video_id}_segments"
             try:
-                raw_text, model_size, whisper_meta = _whisper(video_path, ocr_text, args.ffmpeg_bin, segments_dir)
+                raw_text, model_size, whisper_meta, timeline_segments = _whisper(video_path, ocr_text, args.ffmpeg_bin, segments_dir)
                 source = "Whisper高精度"
                 if ocr_text:
                     source += "+底部硬字幕OCR校对"
@@ -504,6 +695,7 @@ def main() -> None:
                 if ocr_text and _is_low_quality_text(raw_text):
                     raw_text = ocr_text
                     source = "底部硬字幕OCR兜底"
+                    timeline_segments = ocr_segments
                     meta["whisper_low_quality_fallback"] = True
                     meta["fallback_reason"] = "Whisper returned low quality text; using bottom OCR text"
             except Exception as exc:
@@ -511,6 +703,7 @@ def main() -> None:
                     raise
                 raw_text = ocr_text
                 source = "底部硬字幕OCR兜底"
+                timeline_segments = ocr_segments
                 meta["whisper_error"] = str(exc)[-500:]
                 meta["fallback_reason"] = "Whisper failed; using bottom OCR text"
 
@@ -524,7 +717,15 @@ def main() -> None:
     else:
         corrected = _punctuate(raw_text)
     output.write_text(corrected, encoding="utf-8")
-    meta.update({"source": source, "chars": len(corrected)})
+    if not timeline_segments:
+        timeline_segments = _coarse_timeline(corrected, source, duration_seconds)
+    meta.update(
+        {
+            "source": source,
+            "chars": len(corrected),
+            "transcript_timeline_path": _write_timeline_sidecar(output, timeline_segments, source, duration_seconds),
+        }
+    )
     print(json.dumps(meta, ensure_ascii=False))
 
 

@@ -54,3 +54,6 @@ def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+
+def list_visible_files(directory: Path, pattern: str) -> list[Path]:
+    return sorted(path for path in directory.glob(pattern) if path.is_file() and not path.name.startswith("."))

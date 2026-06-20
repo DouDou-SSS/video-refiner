@@ -18,6 +18,28 @@ class ProviderPreset:
 
 PROVIDER_PRESETS: list[ProviderPreset] = [
     ProviderPreset(
+        key="xiaomi_mimo",
+        provider_name="小米 MiMo",
+        base_url="https://token-plan-cn.xiaomimimo.com/v1",
+        analysis_model="mimo-v2.5",
+        merge_model="mimo-v2.5-pro",
+        supports_vision=True,
+        supports_reasoning=False,
+        max_tokens=8192,
+        temperature=0.2,
+    ),
+    ProviderPreset(
+        key="volcengine_ark",
+        provider_name="火山方舟",
+        base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+        analysis_model="ark-code-latest",
+        merge_model="ark-code-latest",
+        supports_vision=True,
+        supports_reasoning=False,
+        max_tokens=8192,
+        temperature=0.2,
+    ),
+    ProviderPreset(
         key="bailian",
         provider_name="阿里云百炼",
         base_url="https://coding.dashscope.aliyuncs.com/v1",
@@ -74,3 +96,5 @@ PROVIDER_PRESETS: list[ProviderPreset] = [
     ),
 ]
 
+
+VISION_CAPABLE_PROVIDER_KEYS = frozenset(item.key for item in PROVIDER_PRESETS if item.supports_vision)

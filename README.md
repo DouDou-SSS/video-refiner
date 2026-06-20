@@ -30,7 +30,9 @@ PYTHONPATH=webapp/backend webapp/backend/.venv/bin/python -m uvicorn videorefine
 - **兜底方案**：无字幕时使用 Whisper；高精度参数失败后自动降级为简单参数
 - ✍️ **文案纠正** — [FunASR](https://github.com/modelscope/FunASR) CT-Transformer 本地模型自动添加标点和分段
 - 🔍 **硬字幕 OCR** — [RapidOCR](https://github.com/RapidAI/RapidOCR) 本地引擎提取画面字幕，1秒1帧全覆盖
+- 🧭 **视频证据时间线** — FFmpeg 覆盖帧与场景检测切段分开标注；视觉标注只做一次，供 5 个单视频维度与 Benchmark 复用，避免把采样窗口误说成真实镜头
 - 📊 **6 维炼化** — 5 个单视频创作方法论维度 + 1 个 Benchmark Intelligence 创作者级汇总维度
+- ✅ **准确性优先** — Benchmark Intelligence 结构化产物必须由模型通过校验后写入；模型拒答、坏 JSON、缺字段或超时都会在页面标注并自动间隔重试，不生成保守降级产物
 - 🧠 **合并精炼** — 最强 LLM + 思考模式，合并所有视频分析为精炼的 .md 文件
 - 📚 **知识库提炼**（v7.1）— 从视频中提取知识内容，不做创作手法分析，输出结构化知识文档
 - 📂 **Obsidian 同步**（v8 新增）— `sync_to_obsidian.py` 自动将本地知识库同步到 Obsidian Vault，含 LLM 自动分类
@@ -121,6 +123,7 @@ output/
 ├── qa_checklist.md      # Benchmark Intelligence 质检清单
 ├── retrieval_index.json # 结构化检索索引
 ├── retrieval_pack.md    # 代表样本检索包
+├── evidence/            # 轻量视觉证据时间线，不复制视频或帧图
 ├── videos/              # 每个视频的 card.json 和 notes.md
 ├── raw/refs.json        # 原始资料引用，不复制大文件
 ├── legacy/              # 旧版 5 个单视频维度合并文档副本
@@ -166,12 +169,16 @@ ffmpeg 抽帧（1秒1帧，全覆盖）
     ↓
 FunASR 本地模型 → 自动标点 + 分段
     ↓
+证据时间线 → 场景变化峰值 + 覆盖帧 + 图文时间关联 → 一次性视觉标注与质量校验
+    ↓
 5 个单视频 Prompt 多维度蒸馏分析
     ↓
 最强 LLM + 思考模式 → 合并精炼输出 → 5 个兼容旧结构的 .md 文件
     ↓
-Benchmark Intelligence 汇总 → 结构化对标知识库产物
+Benchmark Intelligence 按 3 个视频分批生成完整 Card/Notes → 账号级汇总 → 结构化对标知识库产物
 ```
+
+导出给 VideoAutomation 前会执行强制质量核验：Card/Notes/Index 数量与 ID 必须一致，五维分析不得缺失或包含模型拒答，核心方法字段不得为空，产物不得包含本机绝对路径。新版任务还会核验视觉时间线、Card 的 evidence ID 和视觉覆盖状态。导出包只复制轻量 `evidence/*.visual_timeline.json`，不复制图片、原始视频或完整转写。核验通过后，导出包内会新增 `validation_report.json`；失败时只生成 `_FAILED_` 核验报告，不生成可导入成功包。
 
 > **v7 文案提取优化**：有字幕的视频直接跳过 Whisper 转录，节省 80% 时间。硬字幕 OCR 改为 1秒1帧全覆盖，确保字幕完整性。
 
@@ -274,6 +281,8 @@ MIT License
 
 ## 📝 版本历史
 
+- **v8.4 (2026-06-20)** — VideoAutomation 复核补充：区分证据窗口与检测切段，新增视觉可靠性摘要、精确时序资格与轻量检索元数据
+- **v8.3 (2026-06-20)** — 新增视频证据时间线：场景变化、关键帧、图文时间关联、一次性视觉标注、五维 evidence ID 引用，以及轻量导出核验
 - **v8.2 (2026-05-31)** — Web 软件版同步 6 维炼化：5 个单视频维度 + Benchmark Intelligence 结构化对标知识库
 - **v7.1 (2026-05-18)** — 新增知识库提炼模块：从视频提取知识内容，独立于 5 个单视频维度分析
 - **v7 (2026-05-15)** — 文案提取优化：优先使用 CC 字幕/硬字幕 OCR，有字幕时跳过 Whisper；硬字幕 OCR 改为 1秒1帧全覆盖

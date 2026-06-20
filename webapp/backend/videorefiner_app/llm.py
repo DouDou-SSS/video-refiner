@@ -12,6 +12,9 @@ from typing import Any
 from openai import OpenAI
 
 
+CAPABILITY_TEST_MAX_TOKENS = 256
+
+
 def make_test_png_base64(size: int = 32) -> str:
     """Build a small valid PNG whose width and height pass multimodal API limits."""
     raw_rows = b"".join(b"\x00" + (b"\x2f\x91\xc7" * size) for _ in range(size))
@@ -119,7 +122,11 @@ def test_model_profile(profile: dict[str, Any], api_key: str) -> dict[str, Any]:
     client = LLMClient(profile, api_key, timeout_seconds=30.0, rate_limit_retries=0)
 
     try:
-        out = client.chat_text(profile["analysis_model"], "回复 OK，用于测试连接。", max_tokens=16)
+        out = client.chat_text(
+            profile["analysis_model"],
+            "回复 OK，用于测试连接。",
+            max_tokens=CAPABILITY_TEST_MAX_TOKENS,
+        )
         text_ok = bool(out.strip())
     except Exception as exc:
         errors.append(f"文本调用失败：{exc}")
@@ -133,7 +140,7 @@ def test_model_profile(profile: dict[str, Any], api_key: str) -> dict[str, Any]:
             resp = client.client.chat.completions.create(
                 model=profile["analysis_model"],
                 messages=[{"role": "user", "content": content}],
-                max_tokens=16,
+                max_tokens=CAPABILITY_TEST_MAX_TOKENS,
                 temperature=0,
             )
             vision_ok = bool(resp.choices[0].message.content)
@@ -144,7 +151,12 @@ def test_model_profile(profile: dict[str, Any], api_key: str) -> dict[str, Any]:
 
     if text_ok and bool(profile.get("supports_reasoning")):
         try:
-            out = client.chat_text(profile["merge_model"], "回复 OK，用于测试 reasoning 参数。", max_tokens=16, reasoning=True)
+            out = client.chat_text(
+                profile["merge_model"],
+                "回复 OK，用于测试 reasoning 参数。",
+                max_tokens=CAPABILITY_TEST_MAX_TOKENS,
+                reasoning=True,
+            )
             reasoning_ok = bool(out.strip())
         except Exception as exc:
             errors.append(f"reasoning 参数不可用，运行时会自动关闭：{exc}")
