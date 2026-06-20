@@ -1203,6 +1203,14 @@ textarea {
     grid-template-columns: 1fr;
   }
 
+  .frame-settings-head {
+    flex-direction: column;
+  }
+
+  .frame-settings-head button {
+    align-self: flex-start;
+  }
+
   .jobs-layout {
     grid-template-areas:
       "actions"

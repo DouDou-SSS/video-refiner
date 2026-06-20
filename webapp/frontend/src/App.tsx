@@ -23,6 +23,8 @@ import {
   Video,
 } from 'lucide-react';
 
+import { FRAME_ESTIMATE_DURATIONS, frameEstimate } from './frameEstimate';
+
 const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:7860';
 
 type Preset = {
@@ -189,10 +191,6 @@ const ARTIFACT_LABELS: Record<string, string> = {
 };
 
 const CUSTOM_FRAME_INTERVAL_DEFAULT_SECONDS = 5;
-const FRAME_ESTIMATE_DURATIONS = [5, 10, 20, 30, 50];
-const ESTIMATED_FRAME_BYTES = 220 * 1024;
-const MODEL_DIMENSION_COUNT = 5;
-const MODEL_MAX_FRAMES_PER_DIMENSION = 20;
 
 const emptyCleanupSelection = (): Record<CleanupCategory, boolean> => ({
   frames: false,
@@ -405,20 +403,6 @@ function formatBytes(value: number) {
 function formatDurationEstimate(seconds: number) {
   if (seconds < 60) return `约 ${Math.max(1, Math.round(seconds))} 秒`;
   return `约 ${(seconds / 60).toFixed(seconds < 600 ? 1 : 0)} 分钟`;
-}
-
-function defaultFrameInterval(durationMinutes: number) {
-  return durationMinutes <= 10 ? 1 : 5;
-}
-
-function frameEstimate(durationMinutes: number, customIntervalEnabled: boolean, customIntervalSeconds: number) {
-  const intervalSeconds = customIntervalEnabled ? customIntervalSeconds : defaultFrameInterval(durationMinutes);
-  const durationSeconds = durationMinutes * 60;
-  const frameCount = Math.ceil(durationSeconds / Math.max(1, intervalSeconds));
-  const storageBytes = frameCount * ESTIMATED_FRAME_BYTES;
-  const modelFrameCount = Math.min(frameCount, MODEL_MAX_FRAMES_PER_DIMENSION) * MODEL_DIMENSION_COUNT;
-  const modelTimeSeconds = MODEL_DIMENSION_COUNT * 55 + modelFrameCount * 1.2;
-  return { intervalSeconds, frameCount, storageBytes, modelFrameCount, modelTimeSeconds };
 }
 
 function displayJobName(outputDir: string) {
@@ -1140,8 +1124,8 @@ export function App() {
             <div className="frame-settings-panel">
               <div className="frame-settings-head">
                 <div>
-                  <h3>帧图抽取密度</h3>
-                  <p>默认配置会按视频时长自动抽帧：10 分钟内每 1 秒 1 帧，超过 10 分钟每 5 秒 1 帧。拖动滑动条后才启用自定义间隔。</p>
+                  <h3>抽帧与视觉证据</h3>
+                  <p>先按间隔生成原始候选帧，再由后端结合均匀覆盖和场景变化自动选出证据节点。滑块只控制原始候选帧密度，不会取消证据筛选。</p>
                 </div>
                 <button
                   type="button"
@@ -1189,17 +1173,18 @@ export function App() {
                   return (
                     <div className="frame-estimate-card" key={minutes}>
                       <strong>{minutes} 分钟视频</strong>
-                      <small>{estimate.intervalSeconds} 秒/帧</small>
-                      <span>{estimate.frameCount.toLocaleString('zh-CN')} 帧</span>
+                      <small>候选帧：{estimate.intervalSeconds} 秒/帧</small>
+                      <span>{estimate.frameCount.toLocaleString('zh-CN')} 张原始帧</span>
                       <small>{formatBytes(estimate.storageBytes)} 预估容量</small>
-                      <small>模型图 {estimate.modelFrameCount} 张</small>
-                      <small>炼化 {formatDurationEstimate(estimate.modelTimeSeconds)}</small>
+                      <small>证据节点最多 {estimate.evidenceNodeLimit} 个</small>
+                      <small>模型处理约 {estimate.modelImagePasses} 张次</small>
+                      <small>视觉炼化 {formatDurationEstimate(estimate.modelTimeSeconds)}</small>
                     </div>
                   );
                 })}
               </div>
               <p className="frame-estimate-note">
-                时间是这些帧经过筛选后参与 5 个单视频图文维度炼化的粗略预估，不包含 Benchmark Intelligence 汇总，不是 ffmpeg 抽帧耗时。实际耗时会受模型速度、网络和图片复杂度影响。
+                证据节点会按视频时长限制为最多 10/18/30/36 个，并结合均匀覆盖与场景峰值选样；实际数量可能更少。“模型处理张次”包含一次视觉证据标注及后续 5 个维度复用，不代表不同图片数量。时间不包含文案提取和 Benchmark Intelligence 汇总。
               </p>
             </div>
             <button className="primary" disabled={!jobForm.model_profile_id} onClick={createJob}>
